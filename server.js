@@ -19,17 +19,25 @@ import logger                from './src/utils/logger.js'
 // ── Step 1: Validate environment ──────────────────────────────
 validateEnv()
 
-// ── Step 2: Connect to MongoDB ────────────────────────────────
-await connectDB()
+// ── Local development only ────────────────────────────────────
+// Vercel already handles the server runtime.
+// Do not call app.listen() on Vercel.
 
-// ── Step 3: Start HTTP server ──────────────────────────────────
-const server = app.listen(env.PORT, () => {
-  logger.info(`BrewManager API started`, {
-    port:        env.PORT,
-    environment: env.NODE_ENV,
-    url:         `http://localhost:${env.PORT}`,
+let server = null
+
+if (process.env.VERCEL !== '1') {
+  // ── Step 2: Connect to MongoDB ──────────────────────────────
+  await connectDB()
+
+  // ── Step 3: Start HTTP server ───────────────────────────────
+  server = app.listen(env.PORT, () => {
+    logger.info(`BrewManager API started`, {
+      port:        env.PORT,
+      environment: env.NODE_ENV,
+      url:         `http://localhost:${env.PORT}`,
+    })
   })
-})
+}
 
 // ── Graceful shutdown ─────────────────────────────────────────
 // Allows in-flight requests to complete before closing.
@@ -37,12 +45,15 @@ const server = app.listen(env.PORT, () => {
 const shutdown = (signal) => {
   logger.warn(`${signal} received — shutting down gracefully...`)
 
+  if (!server) {
+    process.exit(0)
+  }
+
   server.close(() => {
     logger.info('HTTP server closed')
     process.exit(0)
   })
 
-  // Force exit after 10 seconds if graceful shutdown stalls
   setTimeout(() => {
     logger.error('Graceful shutdown timed out — forcing exit')
     process.exit(1)
