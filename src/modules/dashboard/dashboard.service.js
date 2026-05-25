@@ -1,0 +1,459 @@
+// ============================================================
+// modules/dashboard/dashboard.service.js
+// All dashboard analytics via MongoDB aggregation pipelines.
+//
+// Design decisions:
+//   - NO data is stored separately for analytics.
+//     All results are computed on-demand from:
+//     Sale, Expense, Attendance, Employee, Payroll collections.
+//   - Every pipeline opens with $match as the FIRST stage.
+//     This ensures compound indexes are used and collection
+//     scans are avoided.
+//   - Parallel execution: independent pipelines run via
+//     Promise.all() — no sequential aggregation bottlenecks.
+//   - Outlet scoping is applied inside matchStage helpers,
+//     consistent with the pattern used across all modules.
+//   - Date normalization to UTC midnight is applied to
+//     startDate/endDate before being used in $match.
+//   - All monetary values are returned as-is (no rounding
+//     here — frontend handles display formatting).
+// ============================================================
+
+import mongoose from 'mongoose'
+import Sale       from '../../models/Sale.model.js'
+import Expense    from '../../models/Expense.model.js'
+import Attendance from '../../models/Attendance.model.js'
+import Employee   from '../../models/Employee.model.js'
+import { ROLES }  from '../../constants/permissions.js'
+
+// ── Helpers ───────────────────────────────────────────────────
+
+/**
+ * Normalizes a date to midnight UTC.
+ */
+const toUtcStart = (value) => {
+  const d = new Date(value)
+  d.setUTCHours(0, 0, 0, 0)
+  return d
+}
+
+/**
+ * Normalizes a date to end of day UTC (23:59:59.999).
+ */
+const toUtcEnd = (value) => {
+  const d = new Date(value)
+  d.setUTCHours(23, 59, 59, 999)
+  return d
+}
+
+/**
+ * Builds a $match object for tenant + outlet scope.
+ * Applies outletId from query if provided and permitted.
+ * Manager is always locked to their own outletId.
+ *
+ * @param {string|null} tenantId
+ * @param {Object} user
+ * @param {Object} queryParams
+ * @returns {Object} MongoDB $match filter
+ */
+const buildMatchScope = (tenantId, user, queryParams = {}) => {
+  const match = {}
+
+  if (user.role !== ROLES.SUPER_ADMIN) {
+    match.tenantId = new mongoose.Types.ObjectId(tenantId)
+  }
+
+  // Manager is outlet-locked — always override with token outletId
+  if (user.role === ROLES.MANAGER && user.outletId) {
+    match.outletId = new mongoose.Types.ObjectId(user.outletId)
+  } else if (
+    queryParams.outletId &&
+    user.role !== ROLES.MANAGER
+  ) {
+    match.outletId = new mongoose.Types.ObjectId(queryParams.outletId)
+  }
+
+  return match
+}
+
+/**
+ * Adds date range filter to an existing match object.
+ * Mutates and returns the match object.
+ */
+const applyDateRange = (match, queryParams) => {
+  if (queryParams.startDate || queryParams.endDate) {
+    match.date = {}
+    if (queryParams.startDate) match.date.$gte = toUtcStart(queryParams.startDate)
+    if (queryParams.endDate)   match.date.$lte = toUtcEnd(queryParams.endDate)
+  }
+  return match
+}
+
+// ── getSummary ────────────────────────────────────────────────
+
+/**
+ * KPI Summary — aggregates core metrics in parallel.
+ *
+ * Returns:
+ *   totalRevenue    — sum of Sale.totalRevenue
+ *   totalExpense    — sum of Expense.amount
+ *   netProfit       — totalRevenue - totalExpense
+ *   totalCups       — sum of Sale.totalCups
+ *   totalEmployees  — count of active employees in scope
+ *   attendanceRate  — (present + late) / total records × 100
+ *
+ * @param {Object} params
+ * @param {string|null} params.tenantId
+ * @param {Object} params.user
+ * @param {Object} params.queryParams - { startDate, endDate, outletId }
+ */
+export const getSummary = async ({ tenantId, user, queryParams }) => {
+  const scopeBase = buildMatchScope(tenantId, user, queryParams)
+
+  const salesMatch      = applyDateRange({ ...scopeBase }, queryParams)
+  const expenseMatch    = applyDateRange({ ...scopeBase }, queryParams)
+  const attendanceMatch = applyDateRange({ ...scopeBase }, queryParams)
+
+  // Employee count uses outletId scope but no date filter
+  const employeeMatch = { ...scopeBase, isActive: true }
+  delete employeeMatch.date
+
+  const [salesAgg, expenseAgg, attendanceAgg, totalEmployees] = await Promise.all([
+
+    // ── Sales: totalRevenue + totalCups ──
+    Sale.aggregate([
+      { $match: salesMatch },
+      {
+        $group: {
+          _id:          null,
+          totalRevenue: { $sum: '$totalRevenue' },
+          totalCups:    { $sum: '$totalCups' },
+        },
+      },
+    ]),
+
+    // ── Expenses: totalExpense ──
+    Expense.aggregate([
+      { $match: expenseMatch },
+      {
+        $group: {
+          _id:          null,
+          totalExpense: { $sum: '$amount' },
+        },
+      },
+    ]),
+
+    // ── Attendance: present+late vs total ──
+    Attendance.aggregate([
+      { $match: attendanceMatch },
+      {
+        $group: {
+          _id:          null,
+          total:        { $sum: 1 },
+          attended:     {
+            $sum: {
+              $cond: [
+                { $in: ['$status', ['present', 'late']] },
+                1,
+                0,
+              ],
+            },
+          },
+        },
+      },
+    ]),
+
+    // ── Employee count ──
+    Employee.countDocuments(employeeMatch),
+  ])
+
+  const totalRevenue = salesAgg[0]?.totalRevenue  ?? 0
+  const totalCups    = salesAgg[0]?.totalCups     ?? 0
+  const totalExpense = expenseAgg[0]?.totalExpense ?? 0
+  const netProfit    = totalRevenue - totalExpense
+
+  const attendanceTotal   = attendanceAgg[0]?.total    ?? 0
+  const attendancePresent = attendanceAgg[0]?.attended ?? 0
+  const attendanceRate    = attendanceTotal > 0
+    ? Math.round((attendancePresent / attendanceTotal) * 100 * 100) / 100
+    : 0
+
+  return {
+    totalRevenue,
+    totalExpense,
+    netProfit,
+    totalCups,
+    totalEmployees,
+    attendanceRate,       // percentage, 2 decimal places
+  }
+}
+
+// ── getSalesTrend ─────────────────────────────────────────────
+
+/**
+ * Daily sales trend — groups revenue and cups by date.
+ *
+ * Pipeline:
+ *   $match (scope + date range)
+ *   → $group by date (sum revenue + cups)
+ *   → $sort date ascending
+ *   → $project clean date string + metrics
+ *
+ * @param {Object} params
+ */
+export const getSalesTrend = async ({ tenantId, user, queryParams }) => {
+  const match = buildMatchScope(tenantId, user, queryParams)
+  applyDateRange(match, queryParams)
+
+  const results = await Sale.aggregate([
+    { $match: match },
+
+    {
+      $group: {
+        _id: {
+          year:  { $year:  '$date' },
+          month: { $month: '$date' },
+          day:   { $dayOfMonth: '$date' },
+        },
+        totalRevenue: { $sum: '$totalRevenue' },
+        totalCups:    { $sum: '$totalCups' },
+      },
+    },
+
+    { $sort: { '_id.year': 1, '_id.month': 1, '_id.day': 1 } },
+
+    {
+      $project: {
+        _id:  0,
+        date: {
+          $dateToString: {
+            format: '%Y-%m-%d',
+            date: {
+              $dateFromParts: {
+                year:  '$_id.year',
+                month: '$_id.month',
+                day:   '$_id.day',
+              },
+            },
+          },
+        },
+        totalRevenue: 1,
+        totalCups:    1,
+      },
+    },
+  ])
+
+  return results
+}
+
+// ── getExpenseTrend ───────────────────────────────────────────
+
+/**
+ * Daily expense trend — groups total expense by date.
+ *
+ * Pipeline:
+ *   $match (scope + date range)
+ *   → $group by date (sum amount)
+ *   → $sort date ascending
+ *   → $project clean date string
+ *
+ * @param {Object} params
+ */
+export const getExpenseTrend = async ({ tenantId, user, queryParams }) => {
+  const match = buildMatchScope(tenantId, user, queryParams)
+  applyDateRange(match, queryParams)
+
+  const results = await Expense.aggregate([
+    { $match: match },
+
+    {
+      $group: {
+        _id: {
+          year:  { $year:  '$date' },
+          month: { $month: '$date' },
+          day:   { $dayOfMonth: '$date' },
+        },
+        totalExpense: { $sum: '$amount' },
+      },
+    },
+
+    { $sort: { '_id.year': 1, '_id.month': 1, '_id.day': 1 } },
+
+    {
+      $project: {
+        _id:  0,
+        date: {
+          $dateToString: {
+            format: '%Y-%m-%d',
+            date: {
+              $dateFromParts: {
+                year:  '$_id.year',
+                month: '$_id.month',
+                day:   '$_id.day',
+              },
+            },
+          },
+        },
+        totalExpense: 1,
+      },
+    },
+  ])
+
+  return results
+}
+
+// ── getAttendanceSummary ──────────────────────────────────────
+
+/**
+ * Attendance status breakdown — counts each status value.
+ *
+ * Pipeline:
+ *   $match (scope + date range)
+ *   → $group by status (count)
+ *   → $project into named fields
+ *
+ * Result is always a flat object with all 5 status keys,
+ * defaulting to 0 for statuses with no records.
+ *
+ * @param {Object} params
+ */
+export const getAttendanceSummary = async ({ tenantId, user, queryParams }) => {
+  const match = buildMatchScope(tenantId, user, queryParams)
+  applyDateRange(match, queryParams)
+
+  const results = await Attendance.aggregate([
+    { $match: match },
+    {
+      $group: {
+        _id:   '$status',
+        count: { $sum: 1 },
+      },
+    },
+  ])
+
+  // Build a guaranteed-complete flat object regardless of
+  // which statuses have records in the period
+  const summary = {
+    present: 0,
+    absent:  0,
+    late:    0,
+    leave:   0,
+    holiday: 0,
+    total:   0,
+  }
+
+  for (const row of results) {
+    if (row._id in summary) {
+      summary[row._id] = row.count
+      summary.total   += row.count
+    }
+  }
+
+  // attendanceRate derived here for convenience
+  const attended = summary.present + summary.late
+  summary.attendanceRate = summary.total > 0
+    ? Math.round((attended / summary.total) * 100 * 100) / 100
+    : 0
+
+  return summary
+}
+
+// ── getEmployeePerformance ────────────────────────────────────
+
+/**
+ * Employee performance — joins sales and attendance per employee.
+ *
+ * Strategy:
+ *   Run two independent aggregations in parallel:
+ *     A) Sales grouped by employeeId (totalCups, totalRevenue)
+ *     B) Attendance grouped by employeeId, status
+ *
+ *   Then merge in JS — this is more efficient than a $lookup
+ *   between large aggregation results or a facet pipeline that
+ *   loses index benefits on the second branch.
+ *
+ *   Finally, $lookup Employee name via a separate model query
+ *   (one query, not per-employee).
+ *
+ * Returns employees sorted by totalRevenue descending.
+ *
+ * @param {Object} params
+ */
+export const getEmployeePerformance = async ({ tenantId, user, queryParams }) => {
+  const scopeBase = buildMatchScope(tenantId, user, queryParams)
+
+  const salesMatch      = applyDateRange({ ...scopeBase }, queryParams)
+  const attendanceMatch = applyDateRange({ ...scopeBase }, queryParams)
+
+  const [salesAgg, attendanceAgg] = await Promise.all([
+
+    // A) Sales per employee
+    Sale.aggregate([
+      { $match: salesMatch },
+      {
+        $group: {
+          _id:          '$employeeId',
+          totalCups:    { $sum: '$totalCups' },
+          totalRevenue: { $sum: '$totalRevenue' },
+        },
+      },
+    ]),
+
+    // B) Attendance per employee — count present and late separately
+    Attendance.aggregate([
+      { $match: attendanceMatch },
+      {
+        $group: {
+          _id:               '$employeeId',
+          attendancePresent: {
+            $sum: { $cond: [{ $eq: ['$status', 'present'] }, 1, 0] },
+          },
+          attendanceLate: {
+            $sum: { $cond: [{ $eq: ['$status', 'late'] }, 1, 0] },
+          },
+        },
+      },
+    ]),
+  ])
+
+  // Build lookup maps keyed by employeeId string for O(1) merge
+  const salesMap      = new Map(salesAgg.map((r) => [r._id.toString(), r]))
+  const attendanceMap = new Map(attendanceAgg.map((r) => [r._id.toString(), r]))
+
+  // Union of all employeeIds that appear in either result
+  const allEmployeeIds = new Set([
+    ...salesMap.keys(),
+    ...attendanceMap.keys(),
+  ])
+
+  if (allEmployeeIds.size === 0) return []
+
+  // Fetch employee names in one query
+  const employees = await Employee.find({
+    _id: { $in: [...allEmployeeIds].map((id) => new mongoose.Types.ObjectId(id)) },
+  })
+    .select('_id name')
+    .lean()
+
+  const nameMap = new Map(employees.map((e) => [e._id.toString(), e.name]))
+
+  // Merge all data into final result array
+  const performance = [...allEmployeeIds].map((id) => {
+    const sale       = salesMap.get(id)
+    const attendance = attendanceMap.get(id)
+
+    return {
+      employeeId:        id,
+      employeeName:      nameMap.get(id) ?? 'Unknown',
+      totalCups:         sale?.totalCups         ?? 0,
+      totalRevenue:      sale?.totalRevenue      ?? 0,
+      attendancePresent: attendance?.attendancePresent ?? 0,
+      attendanceLate:    attendance?.attendanceLate    ?? 0,
+    }
+  })
+
+  // Sort by totalRevenue descending
+  performance.sort((a, b) => b.totalRevenue - a.totalRevenue)
+
+  return performance
+}

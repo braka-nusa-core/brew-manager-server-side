@@ -1,0 +1,44 @@
+# dependencies
+node_modules/
+
+# environment variables
+.env
+.env.*
+!.env.example
+
+# logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# runtime
+tmp/
+temp/
+
+# build
+dist/
+build/
+
+# coverage
+coverage/
+
+# cache
+.cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# editor
+.vscode/
+.idea/
+
+# eslint cache
+.eslintcache
+
+# misc
+*.pid
+*.seed
+*.pid.lock
