@@ -58,6 +58,10 @@ export const PERMISSIONS = {
   // Raw Materials (Phase 5a addition)
   MANAGE_RAW_MATERIALS: 'manage:raw_materials',
   VIEW_RAW_MATERIALS:   'view:raw_materials',
+
+  // Bikes (Phase 6B addition)
+  MANAGE_BIKES: 'manage:bikes',
+  VIEW_BIKES:   'view:bikes',
 }
 
 export const ROLE_PERMISSIONS = {
@@ -87,6 +91,8 @@ export const ROLE_PERMISSIONS = {
     PERMISSIONS.VIEW_CUPS,
     PERMISSIONS.MANAGE_RAW_MATERIALS,
     PERMISSIONS.VIEW_RAW_MATERIALS,
+    PERMISSIONS.MANAGE_BIKES,
+    PERMISSIONS.VIEW_BIKES,
   ],
 
   [ROLES.MANAGER]: [
@@ -107,6 +113,8 @@ export const ROLE_PERMISSIONS = {
     PERMISSIONS.MANAGE_CUPS,
     PERMISSIONS.VIEW_CUPS,
     PERMISSIONS.VIEW_RAW_MATERIALS,
+    PERMISSIONS.MANAGE_BIKES,
+    PERMISSIONS.VIEW_BIKES,
   ],
 
   // Cashier: NO attendance access — attendance is manager/admin only.
@@ -119,5 +127,6 @@ export const ROLE_PERMISSIONS = {
     PERMISSIONS.MANAGE_CUPS,
     PERMISSIONS.VIEW_CUPS,
     PERMISSIONS.VIEW_RAW_MATERIALS,
+    PERMISSIONS.VIEW_BIKES,
   ],
 }

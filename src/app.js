@@ -42,6 +42,9 @@ import productRecipeRoutes from './modules/productRecipe/productRecipe.routes.js
 import cupRoutes        from './modules/cup/cup.routes.js'
 import rawMaterialRoutes from './modules/rawMaterial/rawMaterial.routes.js'
 import riderPortalRoutes  from './modules/riderPortal/riderPortal.routes.js'
+import bikeRoutes         from './modules/bike/bike.routes.js'
+import bikeAssignmentRoutes from './modules/bikeAssignment/bikeAssignment.routes.js'
+import { damageReportRouter, repairRecordRouter } from './modules/bikeMaintenance/bikeMaintenance.routes.js'
 
 const app = express()
 
@@ -120,6 +123,12 @@ app.use('/api/v1/raw-materials', rawMaterialRoutes)
 // stacking on /api/v1/auth above. No authenticate/tenantGuard —
 // the portal token itself is the access credential.
 app.use('/api/public/rider', riderPortalRateLimiter, riderPortalRoutes)
+
+// ── Bike Management (Phase 6B) ────────────────────────────────
+app.use('/api/v1/bikes',               bikeRoutes)
+app.use('/api/v1/bike-assignments',    bikeAssignmentRoutes)
+app.use('/api/v1/bike-damage-reports', damageReportRouter)
+app.use('/api/v1/bike-repair-records', repairRecordRouter)
 
 // ── 9. 404 Handler ────────────────────────────────────────────
 app.use(notFoundMiddleware)
