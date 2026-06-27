@@ -1,52 +1,63 @@
 // ============================================================
 // modules/payroll/payroll.service.js
-// All payroll business logic.
+// v2.0 — Phase 4: New payroll calculation engine.
 //
-// CALCULATION FORMULAS:
+// WHAT CHANGED FROM v1.0:
+//   - generatePayroll() now reads Outlet config (payrollType,
+//     commissionPercentage, mealAllowancePerDay, weeklyAttendanceBonus,
+//     bonusRules[]) before the employee loop.
+//   - Sale aggregate changed from single total to per-day grouped result.
+//   - New commission branch: salaryEarned = revenue × commissionPercentage.
+//     No base salary component for commission type.
+//   - New fixed branch: existing formula preserved exactly.
+//   - E14: effectivePresentDays = Math.min(presentDays, workingDays)
+//     used for salary proration only. Meal allowance uses raw presentDays.
+//   - Daily tier bonus evaluated per-day (not monthly aggregate).
+//   - Weekly attendance bonus evaluated per-week with independence rule.
+//   - adjustPayroll() now wires kasbon and uses updated calculateTotalPay().
+//   - PAYROLL_CONFIG.BONUS_PER_CUP is no longer used. Bonus driven by
+//     Outlet.bonusRules[]. cupsBonus set to 0 on all new records.
 //
-//   Monthly salary type:
-//     salaryEarned = (baseSalary / workingDays) × presentDays
+// WHAT DID NOT CHANGE:
+//   - getPayrolls(), getPayrollById() — untouched
+//   - approvePayroll(), rejectPayroll(), markPayrollPaid() — untouched
+//   - Duplicate guard logic — untouched
+//   - Batch insertMany pattern — untouched
+//   - buildBaseQuery() — untouched
+//   - getPeriodDateRange() — untouched
+//   - calculateSalaryEarned() — untouched (called only from fixed branch)
+//   - Status flow (draft → approved → paid) — untouched
+//   - Paid payroll guard in adjustPayroll() — untouched
 //
-//   Daily salary type:
-//     salaryEarned = baseSalary × presentDays
+// E14 RULE:
+//   effectivePresentDays = Math.min(presentDays, workingDays)
+//   Used for salary proration (fixed type) ONLY.
+//   Meal allowance uses raw presentDays from attendance records.
 //
-//   Final:
-//     totalPay = salaryEarned + cupsBonus + manualBonus - deductions
-//     (floor applied — no fractional currency)
-//
-// SNAPSHOT STRATEGY:
-//   At generation time, salaryType and baseSalary are copied
-//   from the Employee document into the Payroll record.
-//   Subsequent employee salary changes do not affect existing payrolls.
-//
-// ATTENDANCE COUNTING:
-//   'present' and 'late' count as attended days.
-//   'absent', 'leave', 'holiday' do not.
-//
-// DUPLICATE GUARD:
-//   The DB unique index on { tenantId, employeeId, period.month, period.year }
-//   is the hard constraint. The service also pre-checks before
-//   attempting generation and skips employees with existing
-//   approved or paid payrolls (those are never overwritten).
-//   Employees with existing draft payrolls are also skipped
-//   to avoid unintended overwrite — the caller must reject/delete first.
+// BACKWARD COMPATIBILITY:
+//   Old payroll records (pre-Phase 4) have null for new fields.
+//   adjustPayroll() uses ?? 0 on all new fields to prevent NaN.
+//   cupsBonus from old records is included in the adjustment
+//   recalculation via ?? 0 so old totals are preserved correctly.
 // ============================================================
 
-import mongoose from 'mongoose'
+import mongoose   from 'mongoose'
 import Payroll    from '../../models/Payroll.model.js'
 import Employee   from '../../models/Employee.model.js'
 import Attendance from '../../models/Attendance.model.js'
 import Sale       from '../../models/Sale.model.js'
+import Outlet     from '../../models/Outlet.model.js'   // Phase 4: added
+import ApiError   from '../../utils/ApiError.js'
 import { buildPaginationQuery, buildPaginationMeta } from '../../utils/pagination.js'
-import { ROLES } from '../../constants/permissions.js'
-import { PAYROLL_CONFIG } from '../../config/payroll.config.js'
+import { ROLES }  from '../../constants/permissions.js'
+// PAYROLL_CONFIG.BONUS_PER_CUP intentionally removed — Phase 4 uses Outlet.bonusRules[]
 
-// ── Helpers ───────────────────────────────────────────────────
+// ── Unchanged helpers ─────────────────────────────────────────
 
 /**
- * Builds the start and end Date for a month/year period.
- * Start: first day of month at 00:00:00 UTC
- * End:   last day of month at 23:59:59.999 UTC
+ * Builds period start/end date range for a month/year.
+ * Start: first millisecond of month (UTC)
+ * End:   last millisecond of month (UTC)
  */
 const getPeriodDateRange = (month, year) => {
   const start = new Date(Date.UTC(year, month - 1, 1, 0, 0, 0, 0))
@@ -55,47 +66,245 @@ const getPeriodDateRange = (month, year) => {
 }
 
 /**
- * Calculates salaryEarned based on salary type.
- * Result is floored to avoid fractional currency units.
+ * Calculates salary earned for fixed-type payroll.
+ * E14: uses effectivePresentDays = Math.min(presentDays, workingDays)
+ * so an employee can never earn more than 100% of prorated salary.
  *
  * @param {string} salaryType - 'monthly' | 'daily'
  * @param {number} baseSalary
- * @param {number} presentDays
+ * @param {number} effectivePresentDays - already capped at workingDays
  * @param {number} workingDays
  * @returns {number}
  */
-const calculateSalaryEarned = (salaryType, baseSalary, presentDays, workingDays) => {
+const calculateSalaryEarned = (salaryType, baseSalary, effectivePresentDays, workingDays) => {
   if (salaryType === 'monthly') {
-    return Math.floor((baseSalary / workingDays) * presentDays)
+    return Math.floor((baseSalary / workingDays) * effectivePresentDays)
   }
   // daily
-  return Math.floor(baseSalary * presentDays)
+  return Math.floor(baseSalary * effectivePresentDays)
+}
+
+/**
+ * Builds tenant/outlet scoped base query for payroll reads.
+ */
+const buildBaseQuery = (tenantId, user) => {
+  const query = {}
+  if (user.role === ROLES.SUPER_ADMIN) return query
+  query.tenantId = new mongoose.Types.ObjectId(tenantId)
+  if (user.role === ROLES.MANAGER && user.outletId) {
+    query.outletId = new mongoose.Types.ObjectId(user.outletId)
+  }
+  return query
+}
+
+// ── Phase 4 new helpers ───────────────────────────────────────
+
+/**
+ * Returns total days in a given month/year.
+ * Used for Week 5 guard and period day iteration.
+ *
+ * @param {number} month - 1-12
+ * @param {number} year
+ * @returns {number} last day of month (28, 29, 30, or 31)
+ */
+const getLastDayOfMonth = (month, year) =>
+  new Date(Date.UTC(year, month, 0)).getUTCDate()
+
+/**
+ * Returns an array of all calendar day strings (YYYY-MM-DD) in the period.
+ * Used for daily tier bonus loop.
+ *
+ * @param {number} month - 1-12
+ * @param {number} year
+ * @returns {string[]} e.g. ['2026-05-01', '2026-05-02', ...]
+ */
+const getPeriodDays = (month, year) => {
+  const lastDay = getLastDayOfMonth(month, year)
+  const days = []
+  for (let d = 1; d <= lastDay; d++) {
+    const mm = String(month).padStart(2, '0')
+    const dd = String(d).padStart(2, '0')
+    days.push(`${year}-${mm}-${dd}`)
+  }
+  return days
+}
+
+/**
+ * Builds a Map<dateString, { cups, revenue }> from the per-day
+ * Sales aggregate result.
+ *
+ * @param {Array} salesAggResult - result from per-day $group aggregate
+ * @returns {{ salesMap: Map, totalCups: number, totalRevenue: number }}
+ */
+const buildDailySalesMap = (salesAggResult) => {
+  const salesMap    = new Map()
+  let totalCups     = 0
+  let totalRevenue  = 0
+
+  for (const row of salesAggResult) {
+    // _id.date is a Date object from the aggregate group key
+    const dateStr = new Date(row._id.date).toISOString().split('T')[0]
+    salesMap.set(dateStr, { cups: row.dailyCups, revenue: row.dailyRevenue })
+    totalCups    += row.dailyCups
+    totalRevenue += row.dailyRevenue
+  }
+
+  return { salesMap, totalCups, totalRevenue }
+}
+
+/**
+ * Builds a Map<dateString, status> from attendance records.
+ * Used for weekly bonus week-by-week evaluation.
+ *
+ * @param {Array} attendanceRecords
+ * @returns {Map<string, string>}
+ */
+const buildAttendanceMap = (attendanceRecords) => {
+  const map = new Map()
+  for (const record of attendanceRecords) {
+    const dateStr = new Date(record.date).toISOString().split('T')[0]
+    map.set(dateStr, record.status)
+  }
+  return map
+}
+
+/**
+ * Calculates daily tier bonus accumulated across all days in the period.
+ * Evaluates per-day cups against outlet.bonusRules (sorted ascending).
+ * Tiers are ADDITIVE — all qualifying tiers are summed per day.
+ *
+ * Example: 85 cups, rules=[{50:10000},{80:15000}]
+ *   Day bonus = 10,000 + 15,000 = 25,000
+ *
+ * @param {Map}    salesMap   - Map<dateString, { cups, revenue }>
+ * @param {Array}  bonusRules - [{ minCups, bonusAmount }] sorted ascending
+ * @param {string[]} periodDays - all calendar day strings in period
+ * @returns {{ totalBonus: number, bonusBreakdown: Array }}
+ */
+const calculateDailyTierBonus = (salesMap, bonusRules, periodDays) => {
+  let totalBonus    = 0
+  const bonusBreakdown = []
+
+  // Sort ascending to ensure correct additive evaluation
+  const sortedRules = [...bonusRules].sort((a, b) => a.minCups - b.minCups)
+
+  for (const dayStr of periodDays) {
+    const cupsSoldToday = salesMap.get(dayStr)?.cups ?? 0
+    let dayBonus = 0
+
+    for (const tier of sortedRules) {
+      if (cupsSoldToday >= tier.minCups) {
+        dayBonus += tier.bonusAmount
+      }
+    }
+
+    totalBonus += dayBonus
+    bonusBreakdown.push({
+      date:     new Date(dayStr),
+      cupsSold: cupsSoldToday,
+      bonus:    dayBonus,
+    })
+  }
+
+  return { totalBonus, bonusBreakdown }
+}
+
+/**
+ * Calculates weekly attendance bonus for the payroll period.
+ *
+ * Week definitions (per confirmed business rules):
+ *   Week 1: days  1– 7
+ *   Week 2: days  8–14
+ *   Week 3: days 15–21
+ *   Week 4: days 22–28
+ *   Week 5: days 29–end  (only if lastDayOfMonth >= 29)
+ *
+ * Qualification: ALL working days in week must have status IN ['present','late']
+ * Independence:  each week evaluated separately — failed weeks do not cascade
+ * Vacuous truth guard: a week with 0 attendance records is NOT qualified
+ *
+ * @param {Map}    attendanceMap     - Map<dateString, status>
+ * @param {number} month             - 1-12
+ * @param {number} year
+ * @param {number} bonusPerWeek      - Outlet.weeklyAttendanceBonus
+ * @returns {{ totalBonus: number, weeklyBonusBreakdown: Array }}
+ */
+const calculateWeeklyAttendanceBonus = (attendanceMap, month, year, bonusPerWeek) => {
+  const QUALIFIED_STATUSES = ['present', 'late']
+  const lastDay            = getLastDayOfMonth(month, year)
+  const mm                 = String(month).padStart(2, '0')
+
+  // Build week window definitions
+  const weeks = [
+    { weekNumber: 1, start: 1,  end: 7  },
+    { weekNumber: 2, start: 8,  end: 14 },
+    { weekNumber: 3, start: 15, end: 21 },
+    { weekNumber: 4, start: 22, end: 28 },
+  ]
+
+  // Week 5 guard: only add if month has days beyond 28
+  if (lastDay >= 29) {
+    weeks.push({ weekNumber: 5, start: 29, end: lastDay })
+  }
+
+  let totalBonus             = 0
+  const weeklyBonusBreakdown = []
+
+  for (const week of weeks) {
+    // Collect all attendance records that fall within this week window
+    const workingDaysInWeek = []
+
+    for (let d = week.start; d <= Math.min(week.end, lastDay); d++) {
+      const dd      = String(d).padStart(2, '0')
+      const dateStr = `${year}-${mm}-${dd}`
+      if (attendanceMap.has(dateStr)) {
+        workingDaysInWeek.push({ dateStr, status: attendanceMap.get(dateStr) })
+      }
+    }
+
+    // Vacuous truth guard: 0 records = not qualified
+    const qualified =
+      workingDaysInWeek.length > 0 &&
+      workingDaysInWeek.every((d) => QUALIFIED_STATUSES.includes(d.status))
+
+    const bonus = qualified ? bonusPerWeek : 0
+    totalBonus += bonus
+
+    weeklyBonusBreakdown.push({
+      weekNumber: week.weekNumber,
+      qualified,
+      bonus,
+    })
+  }
+
+  return { totalBonus, weeklyBonusBreakdown }
 }
 
 /**
  * Calculates totalPay from all components.
+ * Uses ?? 0 on every field to handle pre-Phase-4 records that have null.
  * Ensures totalPay is never negative (clamped to 0).
+ * Applies Math.floor to eliminate fractional currency.
+ *
+ * Replaces old calculateTotalPay(a, b, c, d) — now takes full payroll object.
+ *
+ * @param {Object} p - payroll document (or plain object with all fields)
+ * @returns {number}
  */
-const calculateTotalPay = (salaryEarned, cupsBonus, manualBonus, deductions) => {
-  return Math.max(0, Math.floor(salaryEarned + cupsBonus + manualBonus - deductions))
-}
-
-/**
- * Builds the base MongoDB query for payroll with tenant/outlet scope.
- */
-const buildBaseQuery = (tenantId, user) => {
-  const query = {}
-
-  if (user.role === ROLES.SUPER_ADMIN) return query
-
-  query.tenantId = new mongoose.Types.ObjectId(tenantId)
-
-  if (user.role === ROLES.MANAGER && user.outletId) {
-    query.outletId = new mongoose.Types.ObjectId(user.outletId)
-  }
-
-  return query
-}
+const calculateTotalPay = (p) =>
+  Math.max(
+    0,
+    Math.floor(
+      (p.salaryEarned          ?? 0)
+      + (p.cupsBonus             ?? 0)   // legacy field — 0 on new records, preserved for old
+      + (p.mealAllowanceTotal    ?? 0)
+      + (p.dailyTierBonus        ?? 0)
+      + (p.weeklyAttendanceBonus ?? 0)
+      + (p.manualBonus           ?? 0)
+      - (p.deductions            ?? 0)
+      - (p.kasbon                ?? 0)
+    )
+  )
 
 // ── generatePayroll ───────────────────────────────────────────
 
@@ -103,15 +312,20 @@ const buildBaseQuery = (tenantId, user) => {
  * Generates payroll records for all active employees in an outlet
  * for a given month/year period.
  *
- * Generation steps per employee:
- *   1. Pull attendance records for the period
- *   2. Count presentDays (present + late), absentDays (others)
- *   3. Pull sales aggregation (totalCupsSold)
- *   4. Apply snapshot: copy salaryType + baseSalary from Employee
- *   5. Calculate salaryEarned, cupsBonus, totalPay
- *   6. Insert payroll record (skip if one already exists)
- *
- * Returns a summary: { generated, skipped, skippedItems }
+ * Phase 4 generation steps per employee:
+ *   0. Fetch outlet config (payrollType, commissionPercentage, bonusRules, etc.)
+ *   1. Pull attendance records → build attendanceMap
+ *   2. Count presentDays, absentDays
+ *   3. Apply E14: effectivePresentDays = Math.min(presentDays, workingDays)
+ *   4. Pull per-day sales aggregate → build dailySalesMap
+ *   5. Branch on outlet.payrollType:
+ *      COMMISSION: salaryEarned = riderRevenue × commissionPercentage / 100
+ *      FIXED:      salaryEarned = existing proration formula (with effectivePresentDays)
+ *   6. Calculate mealAllowanceTotal (both types, uses raw presentDays)
+ *   7. Calculate dailyTierBonus (both types, per-day evaluation)
+ *   8. Calculate weeklyAttendanceBonus (both types, per-week evaluation)
+ *   9. Build payroll document with all fields
+ *  10. Batch insert
  *
  * @param {Object} params
  * @param {string} params.tenantId
@@ -120,14 +334,43 @@ const buildBaseQuery = (tenantId, user) => {
  */
 export const generatePayroll = async ({ tenantId, user, data }) => {
   const { outletId, month, year, workingDays } = data
+  const numMonth       = Number(month)
+  const numYear        = Number(year)
+  const numWorkingDays = Number(workingDays)
 
-  const tenantOid  = user.role !== ROLES.SUPER_ADMIN
+  const tenantOid = user.role !== ROLES.SUPER_ADMIN
     ? new mongoose.Types.ObjectId(tenantId)
     : null
-  const outletOid  = new mongoose.Types.ObjectId(outletId)
-  const { start, end } = getPeriodDateRange(Number(month), Number(year))
+  const outletOid = new mongoose.Types.ObjectId(outletId)
 
-  // 1. Fetch all active employees for this outlet
+  const { start, end } = getPeriodDateRange(numMonth, numYear)
+
+  // ── Step 0: Fetch outlet config (Phase 4 — runs once before employee loop) ──
+
+  const outlet = await Outlet.findOne({
+    _id:       outletOid,
+    isActive:  true,
+    deletedAt: null,
+    ...(tenantOid ? { tenantId: tenantOid } : {}),
+  }).lean()
+
+  if (!outlet) {
+    throw new ApiError(404, 'Outlet not found or is inactive')
+  }
+
+  // Destructure payroll config with safe defaults
+  const payrollType            = outlet.payrollType            ?? 'fixed'
+  const commissionPercentage   = outlet.commissionPercentage   ?? 0
+  const mealAllowancePerDay    = outlet.mealAllowancePerDay    ?? 0
+  const weeklyBonusAmount      = outlet.weeklyAttendanceBonus  ?? 0
+  // Sort bonus rules ascending by minCups — never trust client ordering
+  const bonusRules             = [...(outlet.bonusRules ?? [])].sort((a, b) => a.minCups - b.minCups)
+
+  // Pre-compute period calendar days for tier bonus loop
+  const periodDays = getPeriodDays(numMonth, numYear)
+
+  // ── Fetch employees ───────────────────────────────────────────
+
   const employeeQuery = { outletId: outletOid, isActive: true }
   if (tenantOid) employeeQuery.tenantId = tenantOid
 
@@ -140,19 +383,20 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
   const skippedItems = []
   const payrollDocs  = []
 
+  // ── Per-employee loop ─────────────────────────────────────────
+
   for (const employee of employees) {
     const employeeOid = employee._id
 
-    // 2. Check for existing payroll for this period
+    // ── Duplicate guard ───────────────────────────────────────
     const existingQuery = {
-      employeeId:    employeeOid,
-      'period.month': Number(month),
-      'period.year':  Number(year),
+      employeeId:     employeeOid,
+      'period.month': numMonth,
+      'period.year':  numYear,
     }
     if (tenantOid) existingQuery.tenantId = tenantOid
 
     const existing = await Payroll.findOne(existingQuery).lean()
-
     if (existing) {
       skippedItems.push({
         employeeId:   employeeOid.toString(),
@@ -162,14 +406,13 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
       continue
     }
 
-    // 3. Pull attendance for this employee in this period
+    // ── Step 1–2: Attendance ──────────────────────────────────
     const attendanceRecords = await Attendance.find({
       ...(tenantOid ? { tenantId: tenantOid } : {}),
       employeeId: employeeOid,
       date:       { $gte: start, $lte: end },
     }).lean()
 
-    // Count: present + late = attended; everything else = absent
     let presentDays = 0
     let absentDays  = 0
 
@@ -181,8 +424,16 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
       }
     }
 
-    // 4. Pull sales aggregation for this employee in this period
-    const salesAgg = await Sale.aggregate([
+    // ── Step 3: E14 cap ───────────────────────────────────────
+    // effectivePresentDays used for salary proration ONLY.
+    // Raw presentDays used for mealAllowanceTotal (intentional — see E14 decision).
+    const effectivePresentDays = Math.min(presentDays, numWorkingDays)
+
+    // ── Step 4: Per-day sales aggregate ──────────────────────
+    // Phase 4: group by date to enable per-day tier bonus evaluation.
+    // Old: { _id: null, totalCupsSold: $sum } — single number
+    // New: { _id: { date }, dailyCups: $sum, dailyRevenue: $sum } — per day
+    const salesAggResult = await Sale.aggregate([
       {
         $match: {
           ...(tenantOid ? { tenantId: tenantOid } : {}),
@@ -192,47 +443,103 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
       },
       {
         $group: {
-          _id:           null,
-          totalCupsSold: { $sum: '$totalCups' },
+          _id:          { date: '$date' },
+          dailyCups:    { $sum: '$totalCups' },
+          dailyRevenue: { $sum: '$totalRevenue' },
         },
       },
+      { $sort: { '_id.date': 1 } },
     ])
 
-    const totalCupsSold = salesAgg[0]?.totalCupsSold ?? 0
+    const { salesMap, totalCups: totalCupsSold, totalRevenue } =
+      buildDailySalesMap(salesAggResult)
 
-    // 5. Apply calculation
-    const cupsBonus     = Math.floor(totalCupsSold * PAYROLL_CONFIG.BONUS_PER_CUP)
-    const salaryEarned  = calculateSalaryEarned(
-      employee.salaryType,
-      employee.baseSalary,
-      presentDays,
-      Number(workingDays)
-    )
-    const totalPay = calculateTotalPay(salaryEarned, cupsBonus, 0, 0)
+    // ── Step 5: Branch on payrollType ─────────────────────────
 
-    // 6. Build payroll document (snapshot: copy salary fields from employee)
+    let salaryEarned = 0
+    let commission   = 0
+
+    if (payrollType === 'commission') {
+      // Commission type: no base salary.
+      // Income = commission + allowances + bonuses.
+      commission   = Math.floor(totalRevenue * (commissionPercentage / 100))
+      salaryEarned = commission
+    } else {
+      // Fixed type: existing proration formula, E14 cap applied.
+      salaryEarned = calculateSalaryEarned(
+        employee.salaryType,
+        employee.baseSalary,
+        effectivePresentDays,  // E14: capped at workingDays
+        numWorkingDays
+      )
+    }
+
+    // ── Step 6: Meal allowance (both types, raw presentDays) ──
+    const mealAllowanceTotal = Math.floor(mealAllowancePerDay * presentDays)
+
+    // ── Step 7: Daily tier bonus (both types, per-day evaluation) ──
+    const { totalBonus: dailyTierBonus, bonusBreakdown } =
+      calculateDailyTierBonus(salesMap, bonusRules, periodDays)
+
+    // ── Step 8: Weekly attendance bonus (both types) ──────────
+    const attendanceMap = buildAttendanceMap(attendanceRecords)
+    const { totalBonus: weeklyAttendanceBonus, weeklyBonusBreakdown } =
+      calculateWeeklyAttendanceBonus(attendanceMap, numMonth, numYear, weeklyBonusAmount)
+
+    // ── Step 9: Build payroll document ────────────────────────
+    const payrollFields = {
+      salaryEarned,
+      cupsBonus:             0,            // legacy field — explicitly 0 on Phase 4 records
+      mealAllowanceTotal,
+      dailyTierBonus,
+      weeklyAttendanceBonus,
+      manualBonus:           0,
+      deductions:            0,
+      kasbon:                0,
+    }
+
+    const totalPay = calculateTotalPay(payrollFields)
+
     payrollDocs.push({
       tenantId:     tenantOid ?? undefined,
       outletId:     outletOid,
       employeeId:   employeeOid,
-      period:       { month: Number(month), year: Number(year) },
-      // ── SNAPSHOT ──
+      period:       { month: numMonth, year: numYear },
+
+      // ── Snapshot: employee state at generation time ──
       salaryType:   employee.salaryType,
-      baseSalary:   employee.baseSalary,
-      // ── Attendance ──
-      workingDays:  Number(workingDays),
-      presentDays,
+      baseSalary:   employee.baseSalary,  // preserved for reference; NOT used for commission type
+      payrollType,                         // outlet config snapshot
+
+      // ── Attendance summary ──
+      workingDays:  numWorkingDays,
+      presentDays,                         // raw count (for display and mealAllowance)
       absentDays,
-      // ── Sales ──
+
+      // ── Sales summary ──
       totalCupsSold,
-      cupsBonus,
-      // ── Adjustments (defaults) ──
+
+      // ── Calculated earnings ──
+      commission,                          // 0 for fixed type
+      salaryEarned,
+      cupsBonus:             0,            // legacy field — 0 on Phase 4 records
+      mealAllowanceTotal,
+      dailyTierBonus,
+      weeklyAttendanceBonus,
+
+      // ── Adjustable fields (defaults at generation) ──
       manualBonus:  0,
       deductions:   0,
-      // ── Calculated ──
-      salaryEarned,
+      kasbon:       0,
+
+      // ── Calculated total ──
       totalPay,
-      // ── Status & Audit ──
+
+      // ── Audit trail arrays ──
+      bonusBreakdown,         // per-day: { date, cupsSold, bonus }
+      weeklyBonusBreakdown,   // per-week: { weekNumber, qualified, bonus }
+
+      // ── Status & audit ──
       status:       'draft',
       generatedBy:  new mongoose.Types.ObjectId(user.userId),
       generatedAt:  new Date(),
@@ -241,7 +548,8 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
     })
   }
 
-  // Batch insert — ordered: false so one failure doesn't abort the rest
+  // ── Step 10: Batch insert ─────────────────────────────────────
+  // ordered: false — one failure does not abort the rest
   let generated = 0
 
   if (payrollDocs.length > 0) {
@@ -275,10 +583,8 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
 }
 
 // ── getPayrolls ───────────────────────────────────────────────
+// UNCHANGED from v1.0
 
-/**
- * Returns paginated payroll records with optional filters.
- */
 export const getPayrolls = async ({ tenantId, user, queryParams }) => {
   const { page, limit, skip } = buildPaginationQuery(queryParams)
 
@@ -320,6 +626,7 @@ export const getPayrolls = async ({ tenantId, user, queryParams }) => {
 }
 
 // ── getPayrollById ────────────────────────────────────────────
+// UNCHANGED from v1.0
 
 export const getPayrollById = async ({ tenantId, user, payrollId }) => {
   const query = buildBaseQuery(tenantId, user)
@@ -328,22 +635,15 @@ export const getPayrollById = async ({ tenantId, user, payrollId }) => {
   const payroll = await Payroll.findOne(query).lean()
 
   if (!payroll) {
-    const err = new Error('Payroll record not found')
-    err.statusCode = 404
-    throw err
+    throw new ApiError(404, 'Payroll record not found')
   }
 
   return payroll
 }
 
 // ── approvePayroll ────────────────────────────────────────────
+// UNCHANGED from v1.0
 
-/**
- * Transitions a draft payroll to approved.
- * Sets approvedBy and approvedAt from the authenticated user.
- *
- * @throws {Error} 400 if not in draft status
- */
 export const approvePayroll = async ({ tenantId, user, payrollId }) => {
   const query = buildBaseQuery(tenantId, user)
   query._id = new mongoose.Types.ObjectId(payrollId)
@@ -351,15 +651,11 @@ export const approvePayroll = async ({ tenantId, user, payrollId }) => {
   const payroll = await Payroll.findOne(query)
 
   if (!payroll) {
-    const err = new Error('Payroll record not found')
-    err.statusCode = 404
-    throw err
+    throw new ApiError(404, 'Payroll record not found')
   }
 
   if (payroll.status !== 'draft') {
-    const err = new Error(`Only draft payrolls can be approved. Current status: '${payroll.status}'`)
-    err.statusCode = 400
-    throw err
+    throw new ApiError(400, `Only draft payrolls can be approved. Current status: '${payroll.status}'`)
   }
 
   payroll.status     = 'approved'
@@ -371,13 +667,8 @@ export const approvePayroll = async ({ tenantId, user, payrollId }) => {
 }
 
 // ── rejectPayroll ─────────────────────────────────────────────
+// UNCHANGED from v1.0
 
-/**
- * Reverts an approved payroll back to draft.
- * Clears approval metadata. Cannot revert paid payrolls.
- *
- * @throws {Error} 400 if not in approved status
- */
 export const rejectPayroll = async ({ tenantId, user, payrollId }) => {
   const query = buildBaseQuery(tenantId, user)
   query._id = new mongoose.Types.ObjectId(payrollId)
@@ -385,21 +676,15 @@ export const rejectPayroll = async ({ tenantId, user, payrollId }) => {
   const payroll = await Payroll.findOne(query)
 
   if (!payroll) {
-    const err = new Error('Payroll record not found')
-    err.statusCode = 404
-    throw err
+    throw new ApiError(404, 'Payroll record not found')
   }
 
   if (payroll.status === 'paid') {
-    const err = new Error('Paid payrolls cannot be reverted')
-    err.statusCode = 400
-    throw err
+    throw new ApiError(400, 'Paid payrolls cannot be reverted')
   }
 
   if (payroll.status !== 'approved') {
-    const err = new Error(`Only approved payrolls can be rejected. Current status: '${payroll.status}'`)
-    err.statusCode = 400
-    throw err
+    throw new ApiError(400, `Only approved payrolls can be rejected. Current status: '${payroll.status}'`)
   }
 
   payroll.status     = 'draft'
@@ -411,14 +696,11 @@ export const rejectPayroll = async ({ tenantId, user, payrollId }) => {
 }
 
 // ── adjustPayroll ─────────────────────────────────────────────
+// Phase 4 changes:
+//   1. kasbon wired (was in validation since Phase 1 but not in service)
+//   2. calculateTotalPay() uses new object-based formula with ?? 0 fallbacks
+//      so pre-Phase-4 records with null new fields are handled safely
 
-/**
- * Manually adjusts manualBonus and/or deductions on a payroll.
- * Recalculates totalPay after adjustment.
- * Cannot adjust paid payrolls.
- *
- * @throws {Error} 400 if status is paid
- */
 export const adjustPayroll = async ({ tenantId, user, payrollId, data }) => {
   const query = buildBaseQuery(tenantId, user)
   query._id = new mongoose.Types.ObjectId(payrollId)
@@ -426,40 +708,29 @@ export const adjustPayroll = async ({ tenantId, user, payrollId, data }) => {
   const payroll = await Payroll.findOne(query)
 
   if (!payroll) {
-    const err = new Error('Payroll record not found')
-    err.statusCode = 404
-    throw err
+    throw new ApiError(404, 'Payroll record not found')
   }
 
   if (payroll.status === 'paid') {
-    const err = new Error('Paid payrolls cannot be adjusted')
-    err.statusCode = 400
-    throw err
+    throw new ApiError(400, 'Paid payrolls cannot be adjusted')
   }
 
+  // Apply adjustments
   if (data.manualBonus !== undefined) payroll.manualBonus = data.manualBonus
   if (data.deductions  !== undefined) payroll.deductions  = data.deductions
+  if (data.kasbon      !== undefined) payroll.kasbon      = data.kasbon  // Phase 4: wired
 
-  // Recalculate totalPay with updated adjustments
-  payroll.totalPay = calculateTotalPay(
-    payroll.salaryEarned,
-    payroll.cupsBonus,
-    payroll.manualBonus,
-    payroll.deductions
-  )
+  // Recalculate totalPay using updated formula.
+  // ?? 0 on all fields handles pre-Phase-4 records where new fields are null.
+  payroll.totalPay = calculateTotalPay(payroll)
 
   await payroll.save()
   return payroll.toObject()
 }
 
 // ── markPayrollPaid ───────────────────────────────────────────
+// UNCHANGED from v1.0
 
-/**
- * Transitions an approved payroll to paid.
- * Paid is terminal — no further transitions allowed.
- *
- * @throws {Error} 400 if not approved
- */
 export const markPayrollPaid = async ({ tenantId, user, payrollId }) => {
   const query = buildBaseQuery(tenantId, user)
   query._id = new mongoose.Types.ObjectId(payrollId)
@@ -467,15 +738,11 @@ export const markPayrollPaid = async ({ tenantId, user, payrollId }) => {
   const payroll = await Payroll.findOne(query)
 
   if (!payroll) {
-    const err = new Error('Payroll record not found')
-    err.statusCode = 404
-    throw err
+    throw new ApiError(404, 'Payroll record not found')
   }
 
   if (payroll.status !== 'approved') {
-    const err = new Error(`Only approved payrolls can be marked paid. Current status: '${payroll.status}'`)
-    err.statusCode = 400
-    throw err
+    throw new ApiError(400, `Only approved payrolls can be marked paid. Current status: '${payroll.status}'`)
   }
 
   payroll.status = 'paid'

@@ -1,7 +1,6 @@
 // ============================================================
 // modules/payroll/payroll.validation.js
-// Pure validation functions for payroll operations.
-// No Express dependency — independently testable.
+// v1.1 — Phase 1 extension: kasbon added to adjust validation.
 // ============================================================
 
 const OBJECT_ID_RE = /^[a-f\d]{24}$/i
@@ -11,17 +10,6 @@ const isValidObjectId = (id) =>
 
 // ── validateGeneratePayroll ───────────────────────────────────
 
-/**
- * Validates the request body for generating payroll.
- *
- * outletId:    which outlet's employees to generate payroll for
- * month:       1–12
- * year:        4-digit integer
- * workingDays: actual working days in this period
- *
- * @param {Object} body - req.body
- * @returns {{ isValid: boolean, errors: string[] }}
- */
 export const validateGeneratePayroll = (body) => {
   const errors = []
   const { outletId, month, year, workingDays } = body
@@ -63,21 +51,15 @@ export const validateGeneratePayroll = (body) => {
 }
 
 // ── validateAdjustPayroll ─────────────────────────────────────
+// v1.1: kasbon added as an adjustable field.
+// At least one of manualBonus, deductions, or kasbon must be provided.
 
-/**
- * Validates the request body for adjusting a payroll record.
- * At least one of manualBonus or deductions must be provided.
- * Both are optional individually but at least one is required.
- *
- * @param {Object} body - req.body
- * @returns {{ isValid: boolean, errors: string[] }}
- */
 export const validateAdjustPayroll = (body) => {
   const errors = []
-  const { manualBonus, deductions } = body
+  const { manualBonus, deductions, kasbon } = body
 
-  if (manualBonus === undefined && deductions === undefined) {
-    errors.push('At least one of manualBonus or deductions must be provided')
+  if (manualBonus === undefined && deductions === undefined && kasbon === undefined) {
+    errors.push('At least one of manualBonus, deductions, or kasbon must be provided')
   }
 
   if (manualBonus !== undefined) {
@@ -93,6 +75,14 @@ export const validateAdjustPayroll = (body) => {
       errors.push('deductions must be a number')
     } else if (deductions < 0) {
       errors.push('deductions cannot be negative')
+    }
+  }
+
+  if (kasbon !== undefined) {
+    if (typeof kasbon !== 'number' || isNaN(kasbon)) {
+      errors.push('kasbon must be a number')
+    } else if (kasbon < 0) {
+      errors.push('kasbon cannot be negative')
     }
   }
 

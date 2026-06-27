@@ -1,5 +1,3 @@
-import 'dotenv/config'
-
 // ============================================================
 // config/env.js
 // Centralized environment variable access with startup validation.
@@ -62,4 +60,10 @@ export const env = {
   CORS_ORIGINS: process.env.CORS_ORIGINS
     ? process.env.CORS_ORIGINS.split(',').map((o) => o.trim())
     : ['http://localhost:5173', 'http://localhost:3000'],
+
+  // Frontend base URL — used to construct shareable links (e.g. the
+  // Rider Portal URL returned by POST /employees/:id/generate-portal).
+  // Phase 6A addition. Non-secret, safe localhost default — same
+  // treatment as CORS_ORIGINS above.
+  FRONTEND_URL: process.env.FRONTEND_URL ?? 'http://localhost:5173',
 }

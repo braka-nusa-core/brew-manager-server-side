@@ -15,6 +15,7 @@
 
 import asyncHandler from '../../utils/asyncHandler.js'
 import { successResponse, errorResponse } from '../../utils/apiResponse.js'
+import { env } from '../../config/env.js'
 import { validateCreateEmployee, validateUpdateEmployee } from './employee.validation.js'
 import {
   createEmployee,
@@ -23,6 +24,7 @@ import {
   updateEmployee,
   toggleEmployeeActive,
   softDeleteEmployee,
+  generatePortalToken,
 } from './employee.service.js'
 
 // ── POST /api/v1/employees ────────────────────────────────────
@@ -124,4 +126,23 @@ export const remove = asyncHandler(async (req, res) => {
   })
 
   return res.status(204).send()
+})
+
+// ── POST /api/v1/employees/:employeeId/generate-portal ───────
+// Phase 6A addition. Manager/Admin only (MANAGE_EMPLOYEES, reused
+// — no new permission constant). Rider-only guard enforced in
+// the service layer.
+
+export const generatePortal = asyncHandler(async (req, res) => {
+  const portalToken = await generatePortalToken({
+    tenantId:   req.tenantId,
+    user:       req.user,
+    employeeId: req.params.employeeId,
+  })
+
+  const portalUrl = `${env.FRONTEND_URL}/rider/${portalToken}`
+
+  return res.status(200).json(
+    successResponse('Rider portal generated successfully', { portalToken, portalUrl })
+  )
 })

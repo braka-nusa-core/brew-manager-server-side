@@ -1,10 +1,10 @@
 // ============================================================
 // modules/sales/sales.validation.js
-// Pure validation functions for sales operations.
-// No Express dependency — independently testable.
+// v1.1 — Phase 1 extension: paymentMethod field added.
 // ============================================================
 
-const OBJECT_ID_RE = /^[a-f\d]{24}$/i
+const OBJECT_ID_RE    = /^[a-f\d]{24}$/i
+const PAYMENT_METHODS = ['cash', 'transfer', 'qris']
 
 const isValidObjectId = (id) =>
   typeof id === 'string' && OBJECT_ID_RE.test(id)
@@ -14,15 +14,9 @@ const isValidDate = (value) =>
 
 // ── validateCreateSale ────────────────────────────────────────
 
-/**
- * Validates the request body for creating a sale record.
- *
- * @param {Object} body - req.body
- * @returns {{ isValid: boolean, errors: string[] }}
- */
 export const validateCreateSale = (body) => {
   const errors = []
-  const { employeeId, date, totalCups, totalRevenue, notes } = body
+  const { employeeId, date, totalCups, totalRevenue, notes, paymentMethod } = body
 
   if (!employeeId) {
     errors.push('employeeId is required')
@@ -56,34 +50,36 @@ export const validateCreateSale = (body) => {
     errors.push('notes must be a string')
   }
 
+  // paymentMethod — optional
+  if (paymentMethod !== undefined && paymentMethod !== null) {
+    if (!PAYMENT_METHODS.includes(paymentMethod)) {
+      errors.push(`paymentMethod must be one of: ${PAYMENT_METHODS.join(', ')}`)
+    }
+  }
+
   return { isValid: errors.length === 0, errors }
 }
 
 // ── validateUpdateSale ────────────────────────────────────────
 
-/**
- * Validates the request body for updating a sale record.
- * All fields are optional — only provided fields are validated.
- * tenantId, outletId, employeeId are immutable.
- *
- * @param {Object} body - req.body
- * @returns {{ isValid: boolean, errors: string[] }}
- */
 export const validateUpdateSale = (body) => {
   const errors = []
-  const { tenantId, outletId, employeeId, date, totalCups, totalRevenue, notes } = body
+  const {
+    tenantId, outletId, employeeId,
+    date, totalCups, totalRevenue, notes, paymentMethod,
+  } = body
 
   // Guard immutable fields
-  if (tenantId    !== undefined) errors.push('tenantId cannot be changed')
-  if (outletId    !== undefined) errors.push('outletId cannot be changed')
-  if (employeeId  !== undefined) errors.push('employeeId cannot be changed')
+  if (tenantId   !== undefined) errors.push('tenantId cannot be changed')
+  if (outletId   !== undefined) errors.push('outletId cannot be changed')
+  if (employeeId !== undefined) errors.push('employeeId cannot be changed')
 
-  // Ensure at least one mutable field is provided
-  const hasMutableField = [date, totalCups, totalRevenue, notes].some(
+  // At least one mutable field required
+  const hasMutableField = [date, totalCups, totalRevenue, notes, paymentMethod].some(
     (v) => v !== undefined
   )
   if (!hasMutableField) {
-    errors.push('At least one field (date, totalCups, totalRevenue, notes) must be provided')
+    errors.push('At least one field (date, totalCups, totalRevenue, notes, paymentMethod) must be provided')
   }
 
   if (date !== undefined && !isValidDate(date)) {
@@ -108,6 +104,13 @@ export const validateUpdateSale = (body) => {
 
   if (notes !== undefined && notes !== null && typeof notes !== 'string') {
     errors.push('notes must be a string')
+  }
+
+  // paymentMethod — optional update
+  if (paymentMethod !== undefined && paymentMethod !== null) {
+    if (!PAYMENT_METHODS.includes(paymentMethod)) {
+      errors.push(`paymentMethod must be one of: ${PAYMENT_METHODS.join(', ')}`)
+    }
   }
 
   return { isValid: errors.length === 0, errors }

@@ -10,6 +10,7 @@
 // This file intentionally contains no Express logic.
 // All Express setup is in app.js.
 // ============================================================
+import 'dotenv/config'
 
 import { validateEnv, env } from './src/config/env.js'
 import connectDB             from './src/config/db.js'

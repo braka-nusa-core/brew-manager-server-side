@@ -1,15 +1,14 @@
 // ============================================================
 // app.js
 // Express application setup.
-// Responsible for middleware registration and route mounting.
 //
 // MIDDLEWARE ORDER (mandatory):
-//   1. helmet          — security headers (before any response)
+//   1. helmet          — security headers
 //   2. cors            — CORS policy
-//   3. cookieParser    — parse cookies (needed for refresh token)
-//   4. apiRateLimiter  — general rate limit (before body parsing)
+//   3. cookieParser    — parse httpOnly refresh cookie
+//   4. apiRateLimiter  — general rate limit
 //   5. express.json    — body parsing
-//   6. sanitize        — NoSQL injection + XSS (after body parsing)
+//   6. sanitize        — NoSQL injection + XSS
 //   7. httpLogger      — request logging
 //   8. routes          — business routes
 //   9. notFound        — 404 handler
@@ -23,21 +22,26 @@ import cookieParser from 'cookie-parser'
 
 import { env }        from './config/env.js'
 import { httpLogger } from './utils/logger.js'
-import { apiRateLimiter, authRateLimiter } from './middlewares/rateLimiter.js'
+import { apiRateLimiter, authRateLimiter, riderPortalRateLimiter } from './middlewares/rateLimiter.js'
 import { mongoSanitizeMiddleware, xssSanitizeMiddleware } from './middlewares/sanitize.js'
 import errorMiddleware    from './middlewares/error.middleware.js'
 import notFoundMiddleware from './middlewares/notFound.middleware.js'
 
 // ── Route imports ─────────────────────────────────────────────
 import authRoutes       from './modules/auth/auth.routes.js'
+import tenantRoutes     from './modules/tenant/tenant.routes.js'
+import outletRoutes     from './modules/outlet/outlet.routes.js'
 import employeeRoutes   from './modules/employee/employee.routes.js'
 import attendanceRoutes from './modules/attendance/attendance.routes.js'
 import salesRoutes      from './modules/sales/sales.routes.js'
 import expenseRoutes    from './modules/expense/expense.routes.js'
 import payrollRoutes    from './modules/payroll/payroll.routes.js'
 import dashboardRoutes  from './modules/dashboard/dashboard.routes.js'
-import tenantRoutes from './modules/tenant/tenant.routes.js'
-import outletRoutes from './modules/outlet/outlet.routes.js'
+import productRoutes    from './modules/product/product.routes.js'
+import productRecipeRoutes from './modules/productRecipe/productRecipe.routes.js'
+import cupRoutes        from './modules/cup/cup.routes.js'
+import rawMaterialRoutes from './modules/rawMaterial/rawMaterial.routes.js'
+import riderPortalRoutes  from './modules/riderPortal/riderPortal.routes.js'
 
 const app = express()
 
@@ -68,7 +72,6 @@ app.use(
 )
 
 // ── 3. Cookie Parser ──────────────────────────────────────────
-// Required for req.cookies.refreshToken in auth.controller.js
 app.use(cookieParser())
 
 // ── 4. General Rate Limiting ──────────────────────────────────
@@ -97,14 +100,26 @@ app.get('/health', (req, res) => {
 
 // ── 8. API Routes ─────────────────────────────────────────────
 app.use('/api/v1/auth',       authRateLimiter, authRoutes)
+app.use('/api/v1/tenants',    tenantRoutes)
+app.use('/api/v1/outlets',    outletRoutes)
 app.use('/api/v1/employees',  employeeRoutes)
 app.use('/api/v1/attendance', attendanceRoutes)
 app.use('/api/v1/sales',      salesRoutes)
 app.use('/api/v1/expenses',   expenseRoutes)
 app.use('/api/v1/payroll',    payrollRoutes)
 app.use('/api/v1/dashboard',  dashboardRoutes)
-app.use('/api/v1/tenants', tenantRoutes)
-app.use('/api/v1/outlets', outletRoutes)
+app.use('/api/v1/products',   productRoutes)
+app.use('/api/v1/products/:productId/recipe', productRecipeRoutes)
+app.use('/api/v1/cups',       cupRoutes)
+app.use('/api/v1/raw-materials', rawMaterialRoutes)
+
+// ── Public Routes (Phase 6A) ──────────────────────────────────
+// NOT under /api/v1 — deliberate, distinct public namespace.
+// riderPortalRateLimiter stacks on top of the general apiRateLimiter
+// applied at line 77, exactly the same pattern as authRateLimiter
+// stacking on /api/v1/auth above. No authenticate/tenantGuard —
+// the portal token itself is the access credential.
+app.use('/api/public/rider', riderPortalRateLimiter, riderPortalRoutes)
 
 // ── 9. 404 Handler ────────────────────────────────────────────
 app.use(notFoundMiddleware)

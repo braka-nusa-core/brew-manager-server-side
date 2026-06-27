@@ -52,3 +52,30 @@ export const apiRateLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders:   false,
 })
+
+// ── Rider Portal rate limiter (Phase 6A addition) ─────────────
+// 20 requests per 15 minutes per IP on the public rider portal.
+//
+// This endpoint is unauthenticated and accepts a guessable-format
+// credential (the portal token) directly in the URL — the general
+// apiRateLimiter's generous 500/15min ceiling (designed for an
+// internal business tool, per the design note above) is NOT
+// sufficient here. This mirrors authRateLimiter's exact shape,
+// since both endpoints share the same threat model: brute-force
+// guessing of a secret value with no account lockout.
+//
+// Stacks ON TOP of apiRateLimiter (mounted in app.js the same way
+// authRateLimiter stacks on '/api/v1/auth') — not a replacement.
+
+export const riderPortalRateLimiter = rateLimit({
+  windowMs:        15 * 60 * 1000,   // 15 minutes
+  max:             20,
+  message: {
+    success: false,
+    message: 'Too many requests. Please try again in 15 minutes.',
+    code:    429,
+  },
+  standardHeaders: true,
+  legacyHeaders:   false,
+  skipSuccessfulRequests: false,      // count all requests, not just failed ones
+})

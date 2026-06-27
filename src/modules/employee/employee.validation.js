@@ -1,19 +1,14 @@
 // ============================================================
 // modules/employee/employee.validation.js
-// Input validation for employee create and update operations.
+// v1.1 — Phase 1 extension: employeeType field added.
 //
-// Design decisions:
-//   - Validation is pure functions returning { isValid, errors }.
-//   - No dependency on express-validator — keeps validation
-//     portable and independently testable.
-//   - Controllers call these before invoking the service.
-//   - ObjectId validation uses a simple regex — Mongoose will
-//     also catch invalid IDs, but early validation gives cleaner errors.
-//   - Update validation uses partial rules — only provided
-//     fields are validated; missing fields are not flagged.
+// SYNC RULE [E3]: When employeeType = 'rider', the service
+// automatically sets isRider = true. Validation does not
+// enforce this — it is a service-layer concern.
 // ============================================================
 
 import mongoose from 'mongoose'
+import { EMPLOYEE_TYPES } from '../../models/Employee.model.js'
 
 const SALARY_TYPES  = ['monthly', 'daily']
 const OBJECT_ID_RE  = /^[a-f\d]{24}$/i
@@ -21,27 +16,14 @@ const OBJECT_ID_RE  = /^[a-f\d]{24}$/i
 const isValidObjectId = (id) =>
   typeof id === 'string' && OBJECT_ID_RE.test(id)
 
-// ── createEmployee ───────────────────────────────────────────
+// ── validateCreateEmployee ────────────────────────────────────
 
-/**
- * Validates the request body for creating a new employee.
- * All required fields are checked. outletId from body is
- * validated here but NEVER trusted for tenant scope —
- * that is enforced in the service via tenantGuard context.
- *
- * @param {Object} body - req.body
- * @returns {{ isValid: boolean, errors: string[] }}
- */
 export const validateCreateEmployee = (body) => {
   const errors = []
   const {
-    outletId,
-    name,
-    phone,
-    position,
-    salaryType,
-    baseSalary,
-    joinDate,
+    outletId, name, phone, position,
+    salaryType, baseSalary, joinDate,
+    employeeType,
   } = body
 
   // outletId
@@ -93,44 +75,37 @@ export const validateCreateEmployee = (body) => {
     errors.push('joinDate must be a valid date')
   }
 
+  // employeeType (optional — defaults to 'barista')
+  if (employeeType !== undefined && !EMPLOYEE_TYPES.includes(employeeType)) {
+    errors.push(`employeeType must be one of: ${EMPLOYEE_TYPES.join(', ')}`)
+  }
+
   return { isValid: errors.length === 0, errors }
 }
 
-// ── updateEmployee ───────────────────────────────────────────
+// ── validateUpdateEmployee ────────────────────────────────────
 
-/**
- * Validates the request body for updating an employee.
- * All fields are optional — only provided fields are validated.
- * tenantId and outletId cannot be changed via update — those
- * are rejected if present.
- *
- * @param {Object} body - req.body
- * @returns {{ isValid: boolean, errors: string[] }}
- */
 export const validateUpdateEmployee = (body) => {
   const errors = []
   const {
-    tenantId,
-    outletId,
-    name,
-    phone,
-    position,
-    salaryType,
-    baseSalary,
-    joinDate,
-    isActive,
+    tenantId, outletId, name, phone, position,
+    salaryType, baseSalary, joinDate, isActive,
+    employeeType, isRider,
   } = body
 
-  // Guard: tenantId and outletId are immutable via this endpoint
+  // Guard immutable field
   if (tenantId !== undefined) {
     errors.push('tenantId cannot be changed')
   }
 
-  // outletId CAN be updated (outlet reassignment) — validate if provided
-  if (outletId !== undefined) {
-    if (!isValidObjectId(outletId)) {
-      errors.push('outletId must be a valid ObjectId')
-    }
+  // isRider cannot be set directly — sync'd from employeeType in service
+  if (isRider !== undefined) {
+    errors.push('isRider is managed automatically. Set employeeType to "rider" instead.')
+  }
+
+  // outletId — can be updated (outlet reassignment)
+  if (outletId !== undefined && !isValidObjectId(outletId)) {
+    errors.push('outletId must be a valid ObjectId')
   }
 
   // name
@@ -175,9 +150,14 @@ export const validateUpdateEmployee = (body) => {
     errors.push('joinDate must be a valid date')
   }
 
-  // isActive — not validated here; toggle-active endpoint handles this
+  // isActive — handled by toggle-active endpoint
   if (isActive !== undefined) {
     errors.push('Use the /toggle-active endpoint to change active status')
+  }
+
+  // employeeType
+  if (employeeType !== undefined && !EMPLOYEE_TYPES.includes(employeeType)) {
+    errors.push(`employeeType must be one of: ${EMPLOYEE_TYPES.join(', ')}`)
   }
 
   return { isValid: errors.length === 0, errors }

@@ -1,28 +1,32 @@
 // ============================================================
 // models/Payroll.model.js
-// Stores computed payroll snapshots per employee per period.
+// v1.1 — Phase 1 extension: new payroll type + bonus fields.
 //
-// Design decisions:
-//   SNAPSHOT STRATEGY:
-//     salaryType and baseSalary are copied from the Employee
-//     record at generation time. Even if the employee's salary
-//     changes later, this payroll record is immutable in those
-//     fields. This is critical for payroll history integrity.
+// NEW FIELDS (all optional, default 0 — backward compatible):
+//   payrollType:           'fixed'|'commission'   snapshot at generation
+//   commission:            Number  — revenue × commissionPercentage
+//   mealAllowanceTotal:    Number  — mealAllowancePerDay × presentDays
+//   dailyTierBonus:        Number  — accumulated daily cup tier bonuses
+//   weeklyAttendanceBonus: Number  — accumulated weekly attendance bonuses
+//   kasbon:                Number  — cash advance deduction (manual entry)
+//   bonusBreakdown:        Array   — per-day audit trail for tier bonus
+//   weeklyBonusBreakdown:  Array   — per-week audit trail for attendance bonus
 //
-//   PERIOD:
-//     Stored as { month, year } sub-document (not a Date range)
-//     for intuitive querying and display. The unique index uses
-//     dot-notation on these nested fields.
+// NAMING NOTE:
+//   mealAllowanceTotal (not mealAllowance) — avoids confusion with
+//   Outlet.mealAllowancePerDay (the daily rate config).
+//   mealAllowanceTotal is the calculated period total.
 //
-//   STATUS MACHINE:
-//     draft → approved → paid (forward only)
-//     approved → draft (reject/revert)
-//     paid is terminal — no transitions allowed.
+// SNAPSHOT NOTE:
+//   For commission-type payroll, baseSalary is still copied from
+//   Employee at generation time but is NOT used in calculation.
+//   It is stored for reference only. salaryEarned = commission
+//   for commission type.
 //
-//   CALCULATION FIELDS:
-//     All calculated values are stored explicitly on the document.
-//     No field is derived at read time — this keeps the snapshot
-//     stable and query-performant.
+// EXISTING FIELDS: completely unchanged. cupsBonus field is
+//   preserved (used by old fixed payroll logic) but will not be
+//   populated by the new engine — dailyTierBonus replaces it.
+//   Both fields coexist for backward compatibility.
 // ============================================================
 
 import mongoose from 'mongoose'
@@ -54,7 +58,6 @@ const payrollSchema = new Schema(
     },
 
     // ── Period ────────────────────────────────────────────────
-    // month: 1–12, year: 4-digit integer
 
     period: {
       month: {
@@ -71,8 +74,6 @@ const payrollSchema = new Schema(
     },
 
     // ── Snapshot: Employee State at Generation Time ───────────
-    // These are COPIED from Employee at generation — immutable
-    // after creation regardless of future employee changes.
 
     salaryType: {
       type:     String,
@@ -86,6 +87,21 @@ const payrollSchema = new Schema(
       min:      [0, 'Base salary cannot be negative'],
     },
 
+    // ── Payroll Type Snapshot (Phase 1 addition) ──────────────
+    // Copied from Outlet.payrollType at generation time.
+    // Determines which calculation engine was used.
+    // 'fixed' = base salary engine
+    // 'commission' = revenue × commissionPercentage (no base salary)
+
+    payrollType: {
+      type:    String,
+      enum:    {
+        values:  ['fixed', 'commission'],
+        message: 'payrollType must be "fixed" or "commission"',
+      },
+      default: 'fixed',
+    },
+
     // ── Attendance Summary ────────────────────────────────────
 
     workingDays: {
@@ -95,17 +111,15 @@ const payrollSchema = new Schema(
     },
 
     presentDays: {
-      type:     Number,
-      required: true,
-      default:  0,
-      min:      [0, 'Present days cannot be negative'],
+      type:    Number,
+      default: 0,
+      min:     [0, 'Present days cannot be negative'],
     },
 
     absentDays: {
-      type:     Number,
-      required: true,
-      default:  0,
-      min:      [0, 'Absent days cannot be negative'],
+      type:    Number,
+      default: 0,
+      min:     [0, 'Absent days cannot be negative'],
     },
 
     // ── Sales Summary ─────────────────────────────────────────
@@ -116,14 +130,68 @@ const payrollSchema = new Schema(
       min:     [0, 'Total cups sold cannot be negative'],
     },
 
+    // Legacy field — kept for backward compatibility with old
+    // payroll records. New engine uses dailyTierBonus instead.
     cupsBonus: {
       type:    Number,
       default: 0,
       min:     [0, 'Cups bonus cannot be negative'],
     },
 
+    // ── Commission (Phase 1 addition) ─────────────────────────
+    // Populated for commission-type payrolls only.
+    // commission = riderRevenue × (commissionPercentage / 100)
+    // For fixed-type payrolls, this remains 0.
+
+    commission: {
+      type:    Number,
+      default: 0,
+      min:     [0, 'Commission cannot be negative'],
+    },
+
+    // ── Meal Allowance Total (Phase 1 addition) ───────────────
+    // Calculated: Outlet.mealAllowancePerDay × presentDays
+    // Applies to both fixed and commission payroll types.
+
+    mealAllowanceTotal: {
+      type:    Number,
+      default: 0,
+      min:     [0, 'Meal allowance cannot be negative'],
+    },
+
+    // ── Daily Tier Bonus (Phase 1 addition) ───────────────────
+    // Sum of all qualifying daily cup tier bonuses across the period.
+    // Calculated per-day (not monthly aggregate) from Outlet.bonusRules.
+    // Applies to both fixed and commission payroll types.
+
+    dailyTierBonus: {
+      type:    Number,
+      default: 0,
+      min:     [0, 'Daily tier bonus cannot be negative'],
+    },
+
+    // ── Weekly Attendance Bonus (Phase 1 addition) ────────────
+    // Sum of all qualifying weekly attendance bonuses.
+    // Each qualifying week adds Outlet.weeklyAttendanceBonus.
+    // Evaluated independently per week — no cascading penalties.
+
+    weeklyAttendanceBonus: {
+      type:    Number,
+      default: 0,
+      min:     [0, 'Weekly attendance bonus cannot be negative'],
+    },
+
+    // ── Kasbon (Phase 1 addition) ─────────────────────────────
+    // Cash advance deduction — entered manually during adjust phase.
+    // Same workflow as existing manualBonus and deductions fields.
+
+    kasbon: {
+      type:    Number,
+      default: 0,
+      min:     [0, 'Kasbon cannot be negative'],
+    },
+
     // ── Manual Adjustments ────────────────────────────────────
-    // Can be set/changed on draft payrolls via the adjust endpoint.
 
     manualBonus: {
       type:    Number,
@@ -140,26 +208,52 @@ const payrollSchema = new Schema(
     // ── Calculated Totals ─────────────────────────────────────
 
     salaryEarned: {
-      type:     Number,
-      required: true,
-      default:  0,
+      type:    Number,
+      default: 0,
     },
 
     totalPay: {
-      type:     Number,
-      required: true,
-      default:  0,
+      type:    Number,
+      default: 0,
+    },
+
+    // ── Bonus Audit Trail (Phase 1 addition) ──────────────────
+    // Stored at generation time — never recalculated.
+    // Used for dispute resolution and payslip detail.
+
+    // Per-day breakdown of daily tier bonus.
+    // Each entry: { date, cupsSold, bonus }
+    bonusBreakdown: {
+      type: [{
+        date:     { type: Date,   required: true },
+        cupsSold: { type: Number, required: true, min: 0 },
+        bonus:    { type: Number, required: true, min: 0 },
+        _id:      false,
+      }],
+      default: [],
+    },
+
+    // Per-week breakdown of weekly attendance bonus.
+    // Each entry: { weekNumber, qualified, bonus }
+    weeklyBonusBreakdown: {
+      type: [{
+        weekNumber: { type: Number,  required: true },
+        qualified:  { type: Boolean, required: true },
+        bonus:      { type: Number,  required: true, min: 0 },
+        _id:        false,
+      }],
+      default: [],
     },
 
     // ── Status ────────────────────────────────────────────────
 
     status: {
-      type:     String,
-      enum:     {
+      type:    String,
+      enum:    {
         values:  PAYROLL_STATUSES,
         message: `Status must be one of: ${PAYROLL_STATUSES.join(', ')}`,
       },
-      default:  'draft',
+      default: 'draft',
     },
 
     // ── Audit ─────────────────────────────────────────────────
@@ -194,23 +288,14 @@ const payrollSchema = new Schema(
 
 // ── Indexes ───────────────────────────────────────────────────
 
-// PRIMARY UNIQUE CONSTRAINT:
-// One payroll per employee per period per tenant.
 payrollSchema.index(
-  {
-    tenantId:      1,
-    employeeId:    1,
-    'period.month': 1,
-    'period.year':  1,
-  },
+  { tenantId: 1, employeeId: 1, 'period.month': 1, 'period.year': 1 },
   { unique: true }
 )
 
-// List query: tenant → outlet → period
 payrollSchema.index({ tenantId: 1, outletId: 1, 'period.year': -1, 'period.month': -1 })
-
-// Status filter within tenant
 payrollSchema.index({ tenantId: 1, status: 1 })
+payrollSchema.index({ tenantId: 1, payrollType: 1 })  // Phase 1: filter by type
 
 const Payroll = model('Payroll', payrollSchema)
 

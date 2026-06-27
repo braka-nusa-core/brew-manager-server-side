@@ -1,34 +1,33 @@
 // ============================================================
 // models/Employee.model.js
-// Defines the Employee schema for BrewManager.
+// v1.1 — Phase 1 extension: rider identity fields added.
 //
-// Design decisions:
-//   - Employees are operational records ONLY in MVP.
-//     They do NOT have login access. They are NOT Users.
-//   - tenantId + outletId are mandatory on every document.
-//   - passwordHash is intentionally absent — employees don't auth.
-//   - Soft delete via isActive — hard delete is NEVER used.
-//   - passwordHash absent by design — employees are not users.
-//   - Compound indexes defined for the three most common query patterns.
+// NEW FIELDS (all optional, safe defaults — backward compatible):
+//   employeeType: 'barista'|'cashier'|'supervisor'|'rider'  default:'barista'
+//   isRider:      Boolean  default: false
+//
+// SYNC RULE [E3]:
+//   isRider is automatically kept in sync with employeeType
+//   in the service layer. When employeeType = 'rider', isRider
+//   is set to true. When changed away from 'rider', isRider is
+//   set to false. Both fields are stored for query convenience.
+//   isRider is used as a fast filter without string comparison.
 // ============================================================
 
 import mongoose from 'mongoose'
 
 const { Schema, model } = mongoose
 
-const SALARY_TYPES = ['monthly', 'daily']
+const EMPLOYEE_TYPES = ['barista', 'cashier', 'supervisor', 'rider']
 
 const employeeSchema = new Schema(
   {
     // ── Tenant & Outlet Scope ─────────────────────────────────
-    // Both are required. No employee document can exist outside
-    // a tenant or without outlet assignment.
 
     tenantId: {
       type:     Schema.Types.ObjectId,
       ref:      'Tenant',
       required: [true, 'Tenant ID is required'],
-      index:    true,
     },
 
     outletId: {
@@ -43,20 +42,15 @@ const employeeSchema = new Schema(
       type:      String,
       required:  [true, 'Employee name is required'],
       trim:      true,
-      minlength: [2,  'Name must be at least 2 characters'],
+      minlength: [2,   'Name must be at least 2 characters'],
       maxlength: [100, 'Name must not exceed 100 characters'],
     },
 
     phone: {
-      type:  String,
-      trim:  true,
+      type:    String,
+      trim:    true,
       default: null,
     },
-
-    // ── Role & Position ───────────────────────────────────────
-    // Free-text string (not enum) to allow tenant-specific
-    // position names (e.g. "head barista", "shift lead").
-    // Validation enforces min/max length only.
 
     position: {
       type:      String,
@@ -66,13 +60,36 @@ const employeeSchema = new Schema(
       maxlength: [50, 'Position must not exceed 50 characters'],
     },
 
-    // ── Salary Configuration ──────────────────────────────────
+    // ── Employee Type (Phase 1 addition) ──────────────────────
+    // Classifies the employee's role within the operation.
+    // When employeeType = 'rider', isRider is automatically
+    // set to true by the service layer.
+
+    employeeType: {
+      type:    String,
+      enum:    {
+        values:  EMPLOYEE_TYPES,
+        message: `employeeType must be one of: ${EMPLOYEE_TYPES.join(', ')}`,
+      },
+      default: 'barista',
+    },
+
+    // Convenience flag — true when employeeType = 'rider'.
+    // Kept in sync by service layer. Enables fast indexed queries:
+    //   Employee.find({ tenantId, isRider: true })
+    // without string comparison on employeeType.
+    isRider: {
+      type:    Boolean,
+      default: false,
+    },
+
+    // ── Salary ────────────────────────────────────────────────
 
     salaryType: {
       type:     String,
       enum:     {
-        values:  SALARY_TYPES,
-        message: `Salary type must be one of: ${SALARY_TYPES.join(', ')}`,
+        values:  ['monthly', 'daily'],
+        message: 'salaryType must be either "monthly" or "daily"',
       },
       required: [true, 'Salary type is required'],
     },
@@ -83,7 +100,7 @@ const employeeSchema = new Schema(
       min:      [0, 'Base salary cannot be negative'],
     },
 
-    // ── Dates ─────────────────────────────────────────────────
+    // ── Timeline ──────────────────────────────────────────────
 
     joinDate: {
       type:     Date,
@@ -91,34 +108,49 @@ const employeeSchema = new Schema(
     },
 
     // ── Status ────────────────────────────────────────────────
-    // Soft delete flag. Setting isActive = false deactivates
-    // the employee record but preserves it for payroll history.
 
     isActive: {
       type:    Boolean,
       default: true,
     },
+
+    // ── Rider Portal Token (Phase 6A addition) ────────────────
+    // Public, unauthenticated access token for the Rider Portal
+    // (GET /api/public/rider/:token). Mirrors User.passwordHash's
+    // select: false convention — never returned by any existing
+    // Employee.find()/findOne() call unless explicitly selected
+    // with .select('+portalToken').
+    //
+    // sparse: true is required — most employees are not riders
+    // and will never have a token. A plain unique index would
+    // reject multiple documents with portalToken: undefined;
+    // sparse skips indexing documents where the field is absent.
+    //
+    // Generated via generatePortalToken() in employee.service.js
+    // using crypto.randomBytes — never set directly via PATCH.
+
+    portalToken: {
+      type:    String,
+      select:  false,
+      unique:  true,
+      sparse:  true,
+    },
   },
   {
-    timestamps: true, // adds createdAt and updatedAt automatically
+    timestamps: true,
     versionKey: false,
   }
 )
 
-// ── Compound Indexes ─────────────────────────────────────────
-// Defined as compound indexes with tenantId first (leftmost prefix).
-// This makes tenant-scoped queries on outletId, name, and isActive
-// fast regardless of total document count.
+// ── Indexes ───────────────────────────────────────────────────
 
-// Primary list query: tenant → outlet
-employeeSchema.index({ tenantId: 1, outletId: 1 })
-
-// Search by name within a tenant
-employeeSchema.index({ tenantId: 1, name: 1 })
-
-// Filter active/inactive employees within a tenant
+employeeSchema.index({ tenantId: 1, outletId: 1, isActive: 1 })
 employeeSchema.index({ tenantId: 1, isActive: 1 })
+employeeSchema.index({ tenantId: 1, isRider: 1, isActive: 1 })  // Phase 1: rider queries
+employeeSchema.index({ tenantId: 1, name: 1 })
 
 const Employee = model('Employee', employeeSchema)
 
 export default Employee
+
+export { EMPLOYEE_TYPES }

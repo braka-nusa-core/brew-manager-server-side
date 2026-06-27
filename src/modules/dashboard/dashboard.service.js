@@ -24,6 +24,7 @@ import Sale       from '../../models/Sale.model.js'
 import Expense    from '../../models/Expense.model.js'
 import Attendance from '../../models/Attendance.model.js'
 import Employee   from '../../models/Employee.model.js'
+import Product    from '../../models/Product.model.js'
 import { ROLES }  from '../../constants/permissions.js'
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -456,4 +457,55 @@ export const getEmployeePerformance = async ({ tenantId, user, queryParams }) =>
   performance.sort((a, b) => b.totalRevenue - a.totalRevenue)
 
   return performance
+}
+
+// ── getProductMargins ─────────────────────────────────────────
+// Phase 5c addition.
+//
+// Intentionally NOT an aggregation pipeline — per approved
+// architecture, this reads Product.find() directly and maps
+// results in JS, since margin is already fully computable from
+// fields already stored on each Product document (sellingPrice,
+// cachedHPP). No $lookup, no Sale, no ProductRecipe involved.
+//
+// Signature is simpler than other dashboard functions (tenantId
+// only, no user/queryParams) because Product has no outlet
+// scoping and no date relevance — there is nothing to filter by
+// beyond tenant and isActive.
+//
+// Returns ALL active products unconditionally — not filtered by
+// recipe existence, cachedHPP value, or sellingPrice value. A
+// product with no recipe/price yet still appears with zeroed
+// margin fields, surfacing incomplete setup rather than hiding it.
+//
+// @param {string|null} tenantId
+// @returns {Promise<Array>} array of margin DTOs
+
+export const getProductMargins = async (tenantId) => {
+  const filter = { isActive: true }
+  if (tenantId) {
+    filter.tenantId = new mongoose.Types.ObjectId(tenantId)
+  }
+
+  const products = await Product.find(filter)
+    .sort({ name: 1 })
+    .lean()
+
+  return products.map((product) => {
+    const sellingPrice = product.sellingPrice ?? 0
+    const cachedHPP     = product.cachedHPP    ?? 0
+    const marginAmount  = sellingPrice - cachedHPP
+    const marginPercentage = sellingPrice > 0
+      ? Math.round((marginAmount / sellingPrice) * 100)
+      : 0
+
+    return {
+      productId:   product._id,
+      productName: product.name,
+      sellingPrice,
+      cachedHPP,
+      marginAmount,
+      marginPercentage,
+    }
+  })
 }

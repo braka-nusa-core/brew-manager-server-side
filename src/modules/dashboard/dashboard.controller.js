@@ -12,6 +12,7 @@ import {
   getExpenseTrend,
   getAttendanceSummary,
   getEmployeePerformance,
+  getProductMargins,
 } from './dashboard.service.js'
 
 // ── GET /api/v1/dashboard/summary ────────────────────────────
@@ -72,4 +73,15 @@ export const employeePerformance = asyncHandler(async (req, res) => {
   })
 
   return res.status(200).json(successResponse('Employee performance retrieved', data))
+})
+
+// ── GET /api/v1/dashboard/product-margins ────────────────────
+// Phase 5c addition. Simpler call shape than other handlers —
+// getProductMargins only needs tenantId (no user/queryParams,
+// since Product has no outlet scoping or date relevance).
+
+export const productMargins = asyncHandler(async (req, res) => {
+  const data = await getProductMargins(req.tenantId)
+
+  return res.status(200).json(successResponse('Product margins retrieved', data))
 })

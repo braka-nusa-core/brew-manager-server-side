@@ -23,6 +23,7 @@ import {
   expenseTrend,
   attendanceSummary,
   employeePerformance,
+  productMargins,
 } from './dashboard.controller.js'
 
 const router = Router()
@@ -36,5 +37,6 @@ router.get('/sales-trend',          salesTrend)
 router.get('/expense-trend',        expenseTrend)
 router.get('/attendance-summary',   attendanceSummary)
 router.get('/employee-performance', employeePerformance)
+router.get('/product-margins',      productMargins)
 
 export default router
