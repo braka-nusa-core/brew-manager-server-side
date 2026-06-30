@@ -51,6 +51,10 @@ import ApiError   from '../../utils/ApiError.js'
 import { buildPaginationQuery, buildPaginationMeta } from '../../utils/pagination.js'
 import { ROLES }  from '../../constants/permissions.js'
 // PAYROLL_CONFIG.BONUS_PER_CUP intentionally removed — Phase 4 uses Outlet.bonusRules[]
+import { notifyRiderBonusAchieved, notifyPayrollGenerated } from '../notification/notification.service.js'
+// Notification Center addition. Both functions are internally
+// try/catch-wrapped and never throw — they cannot affect any
+// calculation, duplicate-guard, or insertMany logic below.
 
 // ── Unchanged helpers ─────────────────────────────────────────
 
@@ -546,6 +550,24 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
       approvedBy:   null,
       approvedAt:   null,
     })
+
+    // ── Notification Center addition ──────────────────────────
+    // Fires strictly after payrollDocs.push() above — cannot affect
+    // the document just built. Internally try/catch-wrapped in
+    // notification.service.js; never throws, so it can never break
+    // this loop or the batch insert that follows it. Uses
+    // employee.tenantId (not tenantOid) so this is correct even
+    // when a super_admin generates payroll (tenantOid is null then).
+    if (employee.isRider && (dailyTierBonus > 0 || weeklyAttendanceBonus > 0)) {
+      await notifyRiderBonusAchieved({
+        tenantId:    employee.tenantId,
+        outletId:    outletOid,
+        employee,
+        month:       numMonth,
+        year:        numYear,
+        bonusAmount: dailyTierBonus + weeklyAttendanceBonus,
+      })
+    }
   }
 
   // ── Step 10: Batch insert ─────────────────────────────────────
@@ -574,6 +596,22 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
       }
     }
   }
+
+  // ── Notification Center addition ──────────────────────────────
+  // Fires after the batch insert above is fully resolved (success
+  // or partial failure) — uses the already-computed `generated`
+  // and `skippedItems` values, does not recompute or alter them.
+  // Internally try/catch-wrapped; never throws.
+  await notifyPayrollGenerated({
+    tenantId:          outlet.tenantId,
+    outletId:          outletOid,
+    outletName:        outlet.name,
+    generatedByUserId: user.userId,
+    month:             numMonth,
+    year:              numYear,
+    generated,
+    skipped:           skippedItems.length,
+  })
 
   return {
     generated,

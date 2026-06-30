@@ -13,6 +13,9 @@ import Outlet             from '../../models/Outlet.model.js'
 import ApiError           from '../../utils/ApiError.js'
 import { buildPaginationQuery, buildPaginationMeta } from '../../utils/pagination.js'
 import { ROLES } from '../../constants/permissions.js'
+import { notifyBikeMaintenanceOverdue } from '../notification/notification.service.js'
+// Notification Center addition. Internally try/catch-wrapped and
+// never throws — cannot affect anything below it in this file.
 
 // ── Base query builder ────────────────────────────────────────
 // Mirrors employee.service.js / outlet.service.js exactly —
@@ -245,6 +248,26 @@ export const getMaintenanceDashboard = async ({ tenantId, user }) => {
   const outletMap  = new Map(outlets.map((o) => [o._id.toString(), o.name]))
 
   const now = Date.now()
+
+  // ── Notification Center addition ────────────────────────────
+  // No scheduler exists in this codebase — "overdue" is evaluated
+  // lazily here, on every dashboard read, since this is the one
+  // place daysOpen is already computed for every open report.
+  // notifyBikeMaintenanceOverdue is self-deduplicating (skips if
+  // already notified for this exact report) and never throws, so
+  // this cannot create duplicate notifications or break this read.
+  for (const report of reports) {
+    const bike = bikeMap.get(report.bikeId.toString())
+    const daysOpen = Math.floor((now - report.reportedAt.getTime()) / 86400000)
+
+    await notifyBikeMaintenanceOverdue({
+      tenantId:       report.tenantId,
+      outletId:       bike?.outletId,
+      bike,
+      damageReportId: report._id,
+      daysOpen,
+    })
+  }
 
   return reports.map((report) => {
     const bike = bikeMap.get(report.bikeId.toString())

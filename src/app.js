@@ -45,6 +45,7 @@ import riderPortalRoutes  from './modules/riderPortal/riderPortal.routes.js'
 import bikeRoutes         from './modules/bike/bike.routes.js'
 import bikeAssignmentRoutes from './modules/bikeAssignment/bikeAssignment.routes.js'
 import { damageReportRouter, repairRecordRouter } from './modules/bikeMaintenance/bikeMaintenance.routes.js'
+import notificationRoutes from './modules/notification/notification.routes.js'
 
 const app = express()
 
@@ -129,6 +130,11 @@ app.use('/api/v1/bikes',               bikeRoutes)
 app.use('/api/v1/bike-assignments',    bikeAssignmentRoutes)
 app.use('/api/v1/bike-damage-reports', damageReportRouter)
 app.use('/api/v1/bike-repair-records', repairRecordRouter)
+
+// ── Notification Center ───────────────────────────────────────
+// authenticate-only, no tenantGuard/authorize() — see
+// notification.routes.js header note.
+app.use('/api/v1/notifications', notificationRoutes)
 
 // ── 9. 404 Handler ────────────────────────────────────────────
 app.use(notFoundMiddleware)
