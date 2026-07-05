@@ -2,6 +2,8 @@
 // constants/permissions.js
 // v1.1 — Phase 1 extension: MANAGE_PRODUCTS, VIEW_PRODUCTS,
 //         MANAGE_CUPS, VIEW_CUPS added.
+// v1.2 — Sprint 1: VIEWER role added (read-only, outlet-scoped).
+//         VIEW_USERS removed from manager (admin-only concern).
 // ============================================================
 
 export const ROLES = {
@@ -9,6 +11,7 @@ export const ROLES = {
   TENANT_ADMIN: 'tenant_admin',
   MANAGER:      'manager',
   CASHIER:      'cashier',
+  VIEWER:       'viewer',
 }
 
 export const PERMISSIONS = {
@@ -95,9 +98,10 @@ export const ROLE_PERMISSIONS = {
     PERMISSIONS.VIEW_BIKES,
   ],
 
+  // Manager: VIEW_USERS removed (Sprint 1) — user management is
+  // an admin-only concern. Managers operate, they do not manage accounts.
   [ROLES.MANAGER]: [
     PERMISSIONS.VIEW_OUTLETS,
-    PERMISSIONS.VIEW_USERS,
     PERMISSIONS.MANAGE_EMPLOYEES,
     PERMISSIONS.VIEW_EMPLOYEES,
     PERMISSIONS.MANAGE_ATTENDANCE,
@@ -125,6 +129,23 @@ export const ROLE_PERMISSIONS = {
     PERMISSIONS.VIEW_SALES,
     PERMISSIONS.VIEW_PRODUCTS,
     PERMISSIONS.MANAGE_CUPS,
+    PERMISSIONS.VIEW_CUPS,
+    PERMISSIONS.VIEW_RAW_MATERIALS,
+    PERMISSIONS.VIEW_BIKES,
+  ],
+
+  // Viewer: read-only, outlet-scoped.
+  // Can see all operational data for their outlet but cannot write anything.
+  // No user management access — they cannot see who else has login accounts.
+  [ROLES.VIEWER]: [
+    PERMISSIONS.VIEW_OUTLETS,
+    PERMISSIONS.VIEW_EMPLOYEES,
+    PERMISSIONS.VIEW_ATTENDANCE,
+    PERMISSIONS.VIEW_SALES,
+    PERMISSIONS.VIEW_EXPENSES,
+    PERMISSIONS.VIEW_PAYROLL,
+    PERMISSIONS.VIEW_DASHBOARD,
+    PERMISSIONS.VIEW_PRODUCTS,
     PERMISSIONS.VIEW_CUPS,
     PERMISSIONS.VIEW_RAW_MATERIALS,
     PERMISSIONS.VIEW_BIKES,

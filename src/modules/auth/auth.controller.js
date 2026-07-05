@@ -19,7 +19,9 @@ import {
   loginUser,
   refreshAccessToken,
   getCurrentUser,
+  changeOwnPassword,
 } from './auth.service.js'
+import { validateChangePassword } from '../user/user.validation.js'
 import { env } from '../../config/env.js'
 
 // ── Cookie Configuration ─────────────────────────────────────
@@ -126,4 +128,29 @@ export const getMe = asyncHandler(async (req, res) => {
   const user = await getCurrentUser(req.user.userId)
 
   return res.status(200).json(successResponse('User profile retrieved', user))
+})
+
+// ── PATCH /api/v1/auth/change-password ───────────────────────
+
+/**
+ * Self-service password change for the authenticated user.
+ * Requires the user's current password — cannot be used to
+ * reset a forgotten password. Admin password reset is at
+ * PATCH /api/v1/users/:userId/reset-password.
+ *
+ * Requires: authenticate (any role)
+ * Does NOT require: tenantGuard, authorize
+ */
+export const changePassword = asyncHandler(async (req, res) => {
+  const { isValid, errors } = validateChangePassword(req.body)
+
+  if (!isValid) {
+    return res.status(400).json(errorResponse('Validation failed', 400, errors))
+  }
+
+  const { currentPassword, newPassword } = req.body
+
+  await changeOwnPassword(req.user.userId, currentPassword, newPassword)
+
+  return res.status(200).json(successResponse('Password changed successfully', null))
 })

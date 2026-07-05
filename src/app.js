@@ -31,6 +31,7 @@ import notFoundMiddleware from './middlewares/notFound.middleware.js'
 import authRoutes       from './modules/auth/auth.routes.js'
 import tenantRoutes     from './modules/tenant/tenant.routes.js'
 import outletRoutes     from './modules/outlet/outlet.routes.js'
+import userRoutes       from './modules/user/user.routes.js'
 import employeeRoutes   from './modules/employee/employee.routes.js'
 import attendanceRoutes from './modules/attendance/attendance.routes.js'
 import salesRoutes      from './modules/sales/sales.routes.js'
@@ -106,6 +107,7 @@ app.get('/health', (req, res) => {
 app.use('/api/v1/auth',       authRateLimiter, authRoutes)
 app.use('/api/v1/tenants',    tenantRoutes)
 app.use('/api/v1/outlets',    outletRoutes)
+app.use('/api/v1/users',      userRoutes)
 app.use('/api/v1/employees',  employeeRoutes)
 app.use('/api/v1/attendance', attendanceRoutes)
 app.use('/api/v1/sales',      salesRoutes)

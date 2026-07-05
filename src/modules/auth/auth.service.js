@@ -9,12 +9,14 @@
 //   ✅ Token generation (access + refresh)
 //   ✅ Refresh token verification and rotation
 //   ✅ User sanitization before response
+//   ✅ Self-service password change (Sprint 1)
 //   ❌ Does NOT handle req/res — that is controller territory
 //   ❌ Does NOT set cookies — controller does that
 // ============================================================
 
-import User from '../../models/User.model.js'
+import User          from '../../models/User.model.js'
 import comparePassword from '../../utils/comparePassword.js'
+import hashPassword    from '../../utils/hashPassword.js'
 import {
   generateAccessToken,
   generateRefreshToken,
@@ -194,3 +196,57 @@ const sanitizeUser = (user) => ({
   outletId: user.outletId ?? null,
   isActive: user.isActive,
 })
+
+// ── changeOwnPassword ────────────────────────────────────────
+
+/**
+ * Self-service password change for the currently authenticated user.
+ * Requires the current password to be verified first.
+ *
+ * Security notes:
+ *   - currentPassword is verified against the stored hash before
+ *     any changes are made — cannot be skipped.
+ *   - newPassword must differ from currentPassword.
+ *   - Uses the same hashPassword utility as all other flows.
+ *
+ * @param {string} userId          — from req.user.userId (JWT payload)
+ * @param {string} currentPassword — provided by the user in req.body
+ * @param {string} newPassword     — provided by the user in req.body
+ * @returns {Promise<void>}
+ * @throws {Error} 401 if currentPassword is wrong
+ * @throws {Error} 400 if newPassword equals currentPassword
+ * @throws {Error} 404 if user no longer exists
+ */
+export const changeOwnPassword = async (userId, currentPassword, newPassword) => {
+  // Must select passwordHash explicitly — excluded by schema default
+  const user = await User.findById(userId).select('+passwordHash')
+
+  if (!user) {
+    const err = new Error('User not found')
+    err.statusCode = 404
+    throw err
+  }
+
+  if (!user.isActive) {
+    const err = new Error('Your account has been deactivated. Contact your administrator.')
+    err.statusCode = 403
+    throw err
+  }
+
+  const isMatch = await comparePassword(currentPassword, user.passwordHash)
+
+  if (!isMatch) {
+    const err = new Error('Current password is incorrect')
+    err.statusCode = 401
+    throw err
+  }
+
+  if (currentPassword === newPassword) {
+    const err = new Error('New password must be different from the current password')
+    err.statusCode = 400
+    throw err
+  }
+
+  user.passwordHash = await hashPassword(newPassword)
+  await user.save()
+}

@@ -12,6 +12,7 @@
 //
 // Protected routes (authenticate required):
 //   GET   /me
+//   PATCH /change-password   (Sprint 1 — self-service, any role)
 // ============================================================
 
 import { Router } from 'express'
@@ -20,6 +21,7 @@ import {
   logout,
   refreshToken,
   getMe,
+  changePassword,
 } from './auth.controller.js'
 import authenticate from '../../middlewares/authenticate.js'
 
@@ -61,5 +63,20 @@ router.post('/refresh-token', refreshToken)
  * to identify the user, not scope to a tenant resource.
  */
 router.get('/me', authenticate, getMe)
+
+/**
+ * PATCH /api/v1/auth/change-password
+ * Requires: Bearer access token (any role)
+ * Body: { currentPassword, newPassword }
+ *
+ * Self-service password change. Verifies the current password
+ * before accepting the new one. For admin-initiated password
+ * reset (without knowing the current password), use:
+ * PATCH /api/v1/users/:userId/reset-password
+ *
+ * Note: tenantGuard and authorize are not applied — this is a
+ * self-service identity action, same pattern as /me.
+ */
+router.patch('/change-password', authenticate, changePassword)
 
 export default router

@@ -19,13 +19,17 @@
 //   - Compound unique index { tenantId, email } enforces
 //     uniqueness per tenant, not globally — the same email
 //     address can be a user in two different tenants.
+//
+// Sprint 1 additions:
+//   - 'viewer' role added (read-only, outlet-scoped)
+//   - createdBy field added for audit trail
 // ============================================================
 
 import mongoose from 'mongoose'
 
 const { Schema, model } = mongoose
 
-const USER_ROLES = ['super_admin', 'tenant_admin', 'manager', 'cashier']
+const USER_ROLES = ['super_admin', 'tenant_admin', 'manager', 'cashier', 'viewer']
 
 const userSchema = new Schema(
   {
@@ -93,6 +97,17 @@ const userSchema = new Schema(
     isActive: {
       type:    Boolean,
       default: true,
+    },
+
+    // ── Audit ─────────────────────────────────────────────────
+    // createdBy: the userId of the admin who created this account.
+    // Null for accounts created via bootstrap (self-registration).
+    // Immutable — never updated after creation.
+
+    createdBy: {
+      type:    Schema.Types.ObjectId,
+      ref:     'User',
+      default: null,
     },
   },
   {
