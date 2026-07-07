@@ -47,6 +47,9 @@ import bikeRoutes         from './modules/bike/bike.routes.js'
 import bikeAssignmentRoutes from './modules/bikeAssignment/bikeAssignment.routes.js'
 import { damageReportRouter, repairRecordRouter } from './modules/bikeMaintenance/bikeMaintenance.routes.js'
 import notificationRoutes from './modules/notification/notification.routes.js'
+// Sprint 2: Subscription & Plan Management
+import planRoutes from './modules/plan/plan.routes.js'
+import { subscriptionRouter, upgradeRequestRouter } from './modules/subscription/subscription.routes.js'
 
 const app = express()
 
@@ -137,6 +140,11 @@ app.use('/api/v1/bike-repair-records', repairRecordRouter)
 // authenticate-only, no tenantGuard/authorize() — see
 // notification.routes.js header note.
 app.use('/api/v1/notifications', notificationRoutes)
+
+// ── Sprint 2: Subscription & Plan Management ──────────────────
+app.use('/api/v1/plans',            planRoutes)
+app.use('/api/v1/subscriptions',    subscriptionRouter)
+app.use('/api/v1/upgrade-requests', upgradeRequestRouter)
 
 // ── 9. 404 Handler ────────────────────────────────────────────
 app.use(notFoundMiddleware)

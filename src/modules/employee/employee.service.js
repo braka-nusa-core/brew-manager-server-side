@@ -14,6 +14,7 @@ import mongoose from 'mongoose'
 import Employee from '../../models/Employee.model.js'
 import { buildPaginationQuery, buildPaginationMeta } from '../../utils/pagination.js'
 import { ROLES } from '../../constants/permissions.js'
+import { checkPlanLimit } from '../../utils/checkPlanLimit.js'
 
 // ── Query Builder ─────────────────────────────────────────────
 
@@ -42,6 +43,9 @@ const syncIsRider = (employeeType) => employeeType === 'rider'
 // ── createEmployee ────────────────────────────────────────────
 
 export const createEmployee = async ({ tenantId, user, data }) => {
+  // Sprint 2: enforce plan employee limit before creating
+  await checkPlanLimit(tenantId, 'employees')
+
   if (
     user.role === ROLES.MANAGER &&
     data.outletId !== user.outletId.toString()

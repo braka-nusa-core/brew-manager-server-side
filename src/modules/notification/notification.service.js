@@ -322,3 +322,94 @@ export const notifyBikeMaintenanceOverdue = async ({
     logger.error('Failed to create bike_maintenance_overdue notification', { error: err.message })
   }
 }
+
+// ── notifyUpgradeRequestSubmitted ─────────────────────────────
+// Called when a tenant_admin submits an upgrade request.
+// Recipients: all active super_admin users (platform-level action).
+//
+// Never throws — a notification failure must not block the
+// upgrade request being recorded.
+
+export const notifyUpgradeRequestSubmitted = async ({
+  tenantId,
+  tenantName,
+  requestId,
+  fromPlanSlug,
+  toPlanSlug,
+}) => {
+  try {
+    // Notify all active super_admin users
+    const superAdmins = await User.find({
+      role:     ROLES.SUPER_ADMIN,
+      isActive: true,
+    }).select('_id').lean()
+
+    if (superAdmins.length === 0) return
+
+    const title   = 'Upgrade request received'
+    const message = `${tenantName} has requested an upgrade from ${fromPlanSlug} to ${toPlanSlug}.`
+
+    await Promise.all(
+      superAdmins.map((admin) =>
+        createNotification({
+          tenantId,
+          userId:  admin._id,
+          type:    'upgrade_request_submitted',
+          title,
+          message,
+          relatedEntity: { entityType: 'UpgradeRequest', entityId: requestId },
+        })
+      )
+    )
+  } catch (err) {
+    logger.error('Failed to create upgrade_request_submitted notification', { error: err.message })
+  }
+}
+
+// ── notifyUpgradeRequestResolved ──────────────────────────────
+// Called when a super_admin approves or rejects an upgrade request.
+// Recipients: all tenant_admin users of the affected tenant.
+//
+// Never throws — same contract as all other trigger functions.
+
+export const notifyUpgradeRequestResolved = async ({
+  tenantId,
+  requestId,
+  status,      // 'approved' | 'rejected'
+  toPlanSlug,
+  adminNotes,
+}) => {
+  try {
+    // Notify all active tenant_admin users for this tenant
+    const tenantAdmins = await User.find({
+      tenantId: new mongoose.Types.ObjectId(tenantId),
+      role:     ROLES.TENANT_ADMIN,
+      isActive: true,
+    }).select('_id').lean()
+
+    if (tenantAdmins.length === 0) return
+
+    const isApproved = status === 'approved'
+    const title   = isApproved
+      ? `Upgrade to ${toPlanSlug} approved`
+      : `Upgrade to ${toPlanSlug} rejected`
+    const message = isApproved
+      ? `Your upgrade request to the ${toPlanSlug} plan has been approved. New limits are now active.${adminNotes ? ` Note: ${adminNotes}` : ''}`
+      : `Your upgrade request to the ${toPlanSlug} plan was rejected.${adminNotes ? ` Reason: ${adminNotes}` : ''}`
+
+    await Promise.all(
+      tenantAdmins.map((admin) =>
+        createNotification({
+          tenantId,
+          userId:  admin._id,
+          type:    'upgrade_request_resolved',
+          title,
+          message,
+          relatedEntity: { entityType: 'UpgradeRequest', entityId: requestId },
+        })
+      )
+    )
+  } catch (err) {
+    logger.error('Failed to create upgrade_request_resolved notification', { error: err.message })
+  }
+}

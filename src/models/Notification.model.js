@@ -40,6 +40,9 @@ export const NOTIFICATION_TYPES = [
   'payroll_generated',
   'rider_bonus_achieved',
   'bike_maintenance_overdue',
+  // Sprint 2: Subscription & Plan Management
+  'upgrade_request_submitted',   // notifies super_admin when tenant requests upgrade
+  'upgrade_request_resolved',    // notifies tenant_admin when super_admin approves/rejects
 ]
 
 const notificationSchema = new Schema(

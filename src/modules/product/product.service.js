@@ -11,6 +11,7 @@ import mongoose from 'mongoose'
 import Product  from '../../models/Product.model.js'
 import ApiError from '../../utils/ApiError.js'
 import { buildPaginationQuery, buildPaginationMeta } from '../../utils/pagination.js'
+import { checkPlanLimit } from '../../utils/checkPlanLimit.js'
 
 // ── createProduct ─────────────────────────────────────────────
 
@@ -25,6 +26,9 @@ import { buildPaginationQuery, buildPaginationMeta } from '../../utils/paginatio
  * @returns {Promise<Object>} created product
  */
 export const createProduct = async (tenantId, data) => {
+  // Sprint 2: enforce plan product limit before creating
+  await checkPlanLimit(tenantId, 'products')
+
   try {
     const product = await Product.create({
       tenantId:     new mongoose.Types.ObjectId(tenantId),

@@ -4,6 +4,8 @@
 //         MANAGE_CUPS, VIEW_CUPS added.
 // v1.2 — Sprint 1: VIEWER role added (read-only, outlet-scoped).
 //         VIEW_USERS removed from manager (admin-only concern).
+// v1.3 — Sprint 2: MANAGE_PLANS, VIEW_PLANS, MANAGE_SUBSCRIPTIONS,
+//         VIEW_SUBSCRIPTIONS, MANAGE_UPGRADE_REQUESTS added.
 // ============================================================
 
 export const ROLES = {
@@ -65,6 +67,13 @@ export const PERMISSIONS = {
   // Bikes (Phase 6B addition)
   MANAGE_BIKES: 'manage:bikes',
   VIEW_BIKES:   'view:bikes',
+
+  // Plans & Subscriptions (Sprint 2)
+  MANAGE_PLANS:            'manage:plans',
+  VIEW_PLANS:              'view:plans',
+  MANAGE_SUBSCRIPTIONS:    'manage:subscriptions',
+  VIEW_SUBSCRIPTIONS:      'view:subscriptions',
+  MANAGE_UPGRADE_REQUESTS: 'manage:upgrade_requests',
 }
 
 export const ROLE_PERMISSIONS = {
@@ -96,6 +105,9 @@ export const ROLE_PERMISSIONS = {
     PERMISSIONS.VIEW_RAW_MATERIALS,
     PERMISSIONS.MANAGE_BIKES,
     PERMISSIONS.VIEW_BIKES,
+    // Sprint 2 — can view own subscription, submit upgrade requests
+    PERMISSIONS.VIEW_SUBSCRIPTIONS,
+    PERMISSIONS.MANAGE_UPGRADE_REQUESTS,
   ],
 
   // Manager: VIEW_USERS removed (Sprint 1) — user management is

@@ -9,6 +9,7 @@ import mongoose from 'mongoose'
 import Outlet   from '../../models/Outlet.model.js'
 import ApiError from '../../utils/ApiError.js'
 import { buildPaginationQuery, buildPaginationMeta } from '../../utils/pagination.js'
+import { checkPlanLimit } from '../../utils/checkPlanLimit.js'
 import { ROLES } from '../../constants/permissions.js'
 
 // ── Outlet code generator ─────────────────────────────────────
@@ -83,6 +84,9 @@ const buildBaseQuery = (tenantId, user) => {
  * @returns {Promise<Object>} created outlet
  */
 export const createOutlet = async (tenantId, data) => {
+  // Sprint 2: enforce plan outlet limit before creating
+  await checkPlanLimit(tenantId, 'outlets')
+
   const tenantOid  = new mongoose.Types.ObjectId(tenantId)
   const outletCode = await generateOutletCode(tenantOid, data.name, data.code)
 

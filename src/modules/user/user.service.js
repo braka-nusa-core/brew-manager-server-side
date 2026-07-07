@@ -35,6 +35,7 @@ import ApiError     from '../../utils/ApiError.js'
 import hashPassword from '../../utils/hashPassword.js'
 import { buildPaginationQuery, buildPaginationMeta } from '../../utils/pagination.js'
 import { ROLES } from '../../constants/permissions.js'
+import { checkPlanLimit } from '../../utils/checkPlanLimit.js'
 
 // ── Sanitize ──────────────────────────────────────────────────
 
@@ -153,6 +154,13 @@ export const createUser = async (tenantId, caller, data) => {
     role === ROLES.TENANT_ADMIN
   ) {
     throw new ApiError(403, 'tenant_admin cannot create another tenant_admin account')
+  }
+
+  // ── Plan limit guard (Sprint 2) ────────────────────────────
+  // manager/cashier/viewer accounts count against maxAdmins.
+  // tenant_admin is always 1 and is NOT counted.
+  if (role !== ROLES.SUPER_ADMIN && role !== ROLES.TENANT_ADMIN) {
+    await checkPlanLimit(tenantId, 'admins')
   }
 
   // ── Outlet ownership validation ────────────────────────────

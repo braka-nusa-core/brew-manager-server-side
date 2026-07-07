@@ -14,8 +14,7 @@ import ApiError           from '../../utils/ApiError.js'
 import { buildPaginationQuery, buildPaginationMeta } from '../../utils/pagination.js'
 import { ROLES } from '../../constants/permissions.js'
 import { notifyBikeMaintenanceOverdue } from '../notification/notification.service.js'
-// Notification Center addition. Internally try/catch-wrapped and
-// never throws — cannot affect anything below it in this file.
+import { checkPlanLimit } from '../../utils/checkPlanLimit.js'
 
 // ── Base query builder ────────────────────────────────────────
 // Mirrors employee.service.js / outlet.service.js exactly —
@@ -42,6 +41,9 @@ const buildBaseQuery = (tenantId, user) => {
 // ── createBike ────────────────────────────────────────────────
 
 export const createBike = async ({ tenantId, user, data }) => {
+  // Sprint 2: enforce plan bike limit before creating
+  await checkPlanLimit(tenantId, 'bikes')
+
   if (
     user.role === ROLES.MANAGER &&
     data.outletId !== user.outletId.toString()

@@ -8,8 +8,9 @@
 //     2. Create Tenant document
 //     3. Create TenantAdmin User (passwordHash via bcrypt)
 //     4. Create first Outlet
-//     5. On any failure, roll back created docs (compensating deletes)
-//     6. Return { tenant, adminUser (sanitized), outlet }
+//     5. Create Subscription (Sprint 2) — linked to starter plan
+//     6. On any failure, roll back created docs (compensating deletes)
+//     7. Return { tenant, adminUser (sanitized), outlet }
 //
 //   All other functions — super_admin only.
 // ============================================================
@@ -21,6 +22,9 @@ import User      from '../../models/User.model.js'
 import ApiError  from '../../utils/ApiError.js'
 import hashPassword from '../../utils/hashPassword.js'
 import { buildPaginationQuery, buildPaginationMeta } from '../../utils/pagination.js'
+// Sprint 2: create subscription during bootstrap
+import Subscription from '../../models/Subscription.model.js'
+import Plan         from '../../models/Plan.model.js'
 
 // ── Slug helpers ──────────────────────────────────────────────
 
@@ -116,9 +120,10 @@ const generateOutletCode = async (tenantId, outletName, providedCode) => {
  * @returns {Promise<{ tenant, adminUser, outlet }>}
  */
 export const bootstrapTenant = async (data) => {
-  let createdTenant = null
-  let createdUser = null
-  let createdOutlet = null
+  let createdTenant       = null
+  let createdUser         = null
+  let createdOutlet       = null
+  let createdSubscription = null  // Sprint 2
 
   const {
     tenant: tenantData,
@@ -147,12 +152,9 @@ export const bootstrapTenant = async (data) => {
     createdUser = await User.create({
       tenantId: createdTenant._id,
       outletId: null,
-
-      name: userData.name,
-      email: userData.email,
-
+      name:     userData.name,
+      email:    userData.email,
       passwordHash,
-
       role: 'tenant_admin',
     })
 
@@ -165,48 +167,64 @@ export const bootstrapTenant = async (data) => {
 
     createdOutlet = await Outlet.create({
       tenantId: createdTenant._id,
-
-      name: outletData.name,
-      code: outletCode,
-
-      address: outletData.address || null,
-      phone: outletData.phone || null,
-
+      name:     outletData.name,
+      code:     outletCode,
+      address:  outletData.address || null,
+      phone:    outletData.phone   || null,
       isActive: true,
     })
 
-    // ── 5. Sanitize user response ──────────────────────────
+    // ── 5. Create Subscription (Sprint 2) ──────────────────
+    // Look up starter plan — if not yet seeded, gracefully skip.
+    // checkPlanLimit's graceful-degradation ensures limit checks
+    // still pass for tenants without a subscription.
+    const planSlug    = createdTenant.plan || 'starter'
+    const starterPlan = await Plan.findOne({ slug: planSlug, isActive: true }).lean()
+
+    if (starterPlan) {
+      createdSubscription = await Subscription.create({
+        tenantId:     createdTenant._id,
+        planId:       starterPlan._id,
+        planSlug:     starterPlan.slug,
+        status:       'trial',
+        billingCycle: 'monthly',
+        startedAt:    new Date(),
+      })
+    }
+
+    // ── 6. Sanitize user response ──────────────────────────
     const sanitizedUser = {
-      _id: createdUser._id,
-      tenantId: createdUser.tenantId,
-      outletId: createdUser.outletId,
-      name: createdUser.name,
-      email: createdUser.email,
-      role: createdUser.role,
+      _id:       createdUser._id,
+      tenantId:  createdUser.tenantId,
+      outletId:  createdUser.outletId,
+      name:      createdUser.name,
+      email:     createdUser.email,
+      role:      createdUser.role,
       createdAt: createdUser.createdAt,
     }
 
-    // ── 6. Return payload ──────────────────────────────────
+    // ── 7. Return payload ──────────────────────────────────
     return {
-      tenant: createdTenant,
-      adminUser: sanitizedUser,
-      outlet: createdOutlet,
+      tenant:       createdTenant,
+      adminUser:    sanitizedUser,
+      outlet:       createdOutlet,
+      subscription: createdSubscription ?? null,
     }
 
   } catch (err) {
     // ── Rollback ───────────────────────────────────────────
+    if (createdSubscription) {
+      await Subscription.findByIdAndDelete(createdSubscription._id).catch(() => {})
+    }
     if (createdOutlet) {
       await Outlet.findByIdAndDelete(createdOutlet._id).catch(() => {})
     }
-
     if (createdUser) {
       await User.findByIdAndDelete(createdUser._id).catch(() => {})
     }
-
     if (createdTenant) {
       await Tenant.findByIdAndDelete(createdTenant._id).catch(() => {})
     }
-
     throw err
   }
 }
