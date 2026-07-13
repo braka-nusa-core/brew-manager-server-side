@@ -1,6 +1,16 @@
 // ============================================================
 // modules/employee/employee.validation.js
 // v1.1 — Phase 1 extension: employeeType field added.
+// v1.2 — Payroll-config-follows-outlet extension:
+//   salaryType/baseSalary are no longer unconditionally required
+//   here — requiredness depends on the employee's Outlet.payrollType,
+//   which requires a DB read. These functions stay synchronous and
+//   DB-free (matching this module's convention); the conditional
+//   requirement is enforced in employee.service.js, which fetches
+//   the outlet immediately before create/update. This file still
+//   validates salaryType/baseSalary's TYPE/ENUM/RANGE whenever they
+//   ARE present, just no longer forces their presence unconditionally.
+//   ktpStatus (administrative KTP tracking, no file upload) added.
 //
 // SYNC RULE [E3]: When employeeType = 'rider', the service
 // automatically sets isRider = true. Validation does not
@@ -8,7 +18,7 @@
 // ============================================================
 
 import mongoose from 'mongoose'
-import { EMPLOYEE_TYPES } from '../../models/Employee.model.js'
+import { EMPLOYEE_TYPES, KTP_STATUSES } from '../../models/Employee.model.js'
 
 const SALARY_TYPES  = ['monthly', 'daily']
 const OBJECT_ID_RE  = /^[a-f\d]{24}$/i
@@ -23,7 +33,7 @@ export const validateCreateEmployee = (body) => {
   const {
     outletId, name, phone, position,
     salaryType, baseSalary, joinDate,
-    employeeType,
+    employeeType, ktpStatus,
   } = body
 
   // outletId
@@ -52,20 +62,22 @@ export const validateCreateEmployee = (body) => {
     errors.push('position must not exceed 50 characters')
   }
 
-  // salaryType
-  if (!salaryType) {
-    errors.push('salaryType is required')
-  } else if (!SALARY_TYPES.includes(salaryType)) {
+  // salaryType — no longer unconditionally required here. Whether it's
+  // required depends on the employee's Outlet.payrollType, which this
+  // synchronous, DB-free function cannot check — see employee.service.js,
+  // which fetches the outlet and enforces the conditional requirement
+  // immediately before create. Here we only check shape, when present.
+  if (salaryType !== undefined && salaryType !== null && !SALARY_TYPES.includes(salaryType)) {
     errors.push(`salaryType must be one of: ${SALARY_TYPES.join(', ')}`)
   }
 
-  // baseSalary
-  if (baseSalary === undefined || baseSalary === null) {
-    errors.push('baseSalary is required')
-  } else if (typeof baseSalary !== 'number' || isNaN(baseSalary)) {
-    errors.push('baseSalary must be a number')
-  } else if (baseSalary < 0) {
-    errors.push('baseSalary cannot be negative')
+  // baseSalary — same conditional-requiredness note as salaryType above.
+  if (baseSalary !== undefined && baseSalary !== null) {
+    if (typeof baseSalary !== 'number' || isNaN(baseSalary)) {
+      errors.push('baseSalary must be a number')
+    } else if (baseSalary < 0) {
+      errors.push('baseSalary cannot be negative')
+    }
   }
 
   // joinDate
@@ -80,6 +92,11 @@ export const validateCreateEmployee = (body) => {
     errors.push(`employeeType must be one of: ${EMPLOYEE_TYPES.join(', ')}`)
   }
 
+  // ktpStatus (optional — defaults to 'pending')
+  if (ktpStatus !== undefined && !KTP_STATUSES.includes(ktpStatus)) {
+    errors.push(`ktpStatus must be one of: ${KTP_STATUSES.join(', ')}`)
+  }
+
   return { isValid: errors.length === 0, errors }
 }
 
@@ -90,7 +107,7 @@ export const validateUpdateEmployee = (body) => {
   const {
     tenantId, outletId, name, phone, position,
     salaryType, baseSalary, joinDate, isActive,
-    employeeType, isRider,
+    employeeType, isRider, ktpStatus,
   } = body
 
   // Guard immutable field
@@ -158,6 +175,11 @@ export const validateUpdateEmployee = (body) => {
   // employeeType
   if (employeeType !== undefined && !EMPLOYEE_TYPES.includes(employeeType)) {
     errors.push(`employeeType must be one of: ${EMPLOYEE_TYPES.join(', ')}`)
+  }
+
+  // ktpStatus (optional — independently updatable per spec)
+  if (ktpStatus !== undefined && !KTP_STATUSES.includes(ktpStatus)) {
+    errors.push(`ktpStatus must be one of: ${KTP_STATUSES.join(', ')}`)
   }
 
   return { isValid: errors.length === 0, errors }

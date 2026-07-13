@@ -1,10 +1,20 @@
 // ============================================================
 // models/Employee.model.js
 // v1.1 — Phase 1 extension: rider identity fields added.
+// v1.2 — Payroll-config-follows-outlet extension:
+//   - salaryType/baseSalary are no longer schema-required.
+//     Requiredness now depends on the employee's Outlet.payrollType
+//     ('fixed' → required, 'commission' → not required, stored as
+//     null/0). This conditional check needs a DB read (the outlet),
+//     so it is enforced in employee.service.js, NOT here and NOT in
+//     employee.validation.js — see comments there.
+//   - ktpStatus added (administrative tracking only — no file/image
+//     upload, just a status enum).
 //
 // NEW FIELDS (all optional, safe defaults — backward compatible):
 //   employeeType: 'barista'|'cashier'|'supervisor'|'rider'  default:'barista'
 //   isRider:      Boolean  default: false
+//   ktpStatus:    'pending'|'received'  default: 'pending'
 //
 // SYNC RULE [E3]:
 //   isRider is automatically kept in sync with employeeType
@@ -19,6 +29,7 @@ import mongoose from 'mongoose'
 const { Schema, model } = mongoose
 
 const EMPLOYEE_TYPES = ['barista', 'cashier', 'supervisor', 'rider']
+const KTP_STATUSES    = ['pending', 'received']
 
 const employeeSchema = new Schema(
   {
@@ -84,20 +95,39 @@ const employeeSchema = new Schema(
     },
 
     // ── Salary ────────────────────────────────────────────────
+    // Requiredness now depends on the employee's Outlet.payrollType:
+    //   'fixed'      → salaryType + baseSalary required (enforced
+    //                  in employee.service.js, which fetches the
+    //                  outlet before create/update).
+    //   'commission' → not required; stored as null / 0.
+    // No longer `required` at the schema level so commission-outlet
+    // employees can be created/updated without them. Existing
+    // documents (created before this change) are untouched.
 
     salaryType: {
-      type:     String,
-      enum:     {
+      type:    String,
+      enum:    {
         values:  ['monthly', 'daily'],
         message: 'salaryType must be either "monthly" or "daily"',
       },
-      required: [true, 'Salary type is required'],
+      default: null,
     },
 
     baseSalary: {
       type:     Number,
-      required: [true, 'Base salary is required'],
       min:      [0, 'Base salary cannot be negative'],
+      default:  0,
+    },
+
+    // ── KTP Tracking (administrative status only — no file upload) ──
+
+    ktpStatus: {
+      type:    String,
+      enum:    {
+        values:  KTP_STATUSES,
+        message: `ktpStatus must be one of: ${KTP_STATUSES.join(', ')}`,
+      },
+      default: 'pending',
     },
 
     // ── Timeline ──────────────────────────────────────────────
@@ -153,4 +183,4 @@ const Employee = model('Employee', employeeSchema)
 
 export default Employee
 
-export { EMPLOYEE_TYPES }
+export { EMPLOYEE_TYPES, KTP_STATUSES }
