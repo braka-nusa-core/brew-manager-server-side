@@ -14,6 +14,7 @@ import mongoose from 'mongoose'
 const { Schema, model } = mongoose
 
 const PAYMENT_METHODS = ['cash', 'transfer', 'qris']
+const SALE_ORIGINS    = ['manual', 'system']
 
 const saleSchema = new Schema(
   {
@@ -81,6 +82,29 @@ const saleSchema = new Schema(
       default: null,
     },
 
+    // ── Phase 1: automatic Sale generation from CupRecord ──────
+    // origin: 'manual' (existing behavior, default) or 'system'
+    // (auto-generated on CupRecord finalize).
+    // sourceCupRecordId: set only for origin='system'. Unique+sparse
+    // so a CupRecord can generate at most one Sale (idempotent finalize).
+    // Both fields are optional/nullable — fully backward compatible
+    // with existing Sale documents and the manual createSale() flow.
+
+    origin: {
+      type:    String,
+      enum:    {
+        values:  SALE_ORIGINS,
+        message: `origin must be one of: ${SALE_ORIGINS.join(', ')}`,
+      },
+      default: 'manual',
+    },
+
+    sourceCupRecordId: {
+      type:    Schema.Types.ObjectId,
+      ref:     'CupRecord',
+      default: null,
+    },
+
     // ── Audit ─────────────────────────────────────────────────
 
     recordedBy: {
@@ -101,8 +125,12 @@ saleSchema.index({ tenantId: 1, outletId: 1, date: -1 })
 saleSchema.index({ tenantId: 1, employeeId: 1, date: -1 })
 saleSchema.index({ tenantId: 1, date: -1 })
 
+// Phase 1: one Sale per CupRecord (sparse — only applies to docs
+// that actually have a sourceCupRecordId, i.e. system-generated ones).
+saleSchema.index({ sourceCupRecordId: 1 }, { unique: true, sparse: true })
+
 const Sale = model('Sale', saleSchema)
 
 export default Sale
 
-export { PAYMENT_METHODS }
+export { PAYMENT_METHODS, SALE_ORIGINS }

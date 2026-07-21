@@ -12,12 +12,14 @@ import { successResponse, errorResponse } from '../../utils/apiResponse.js'
 import {
   validateCreateCupRecord,
   validateUpdateCupRecord,
+  validateAddRefill,
 } from './cup.validation.js'
 import {
   createCupRecord,
   getCupRecords,
   getCupRecordById,
   updateCupRecord,
+  addCupRefill,
   finalizeCupRecord,
   deleteCupRecord,
   getReconciliation,
@@ -93,6 +95,27 @@ export const update = asyncHandler(async (req, res) => {
   )
 
   return res.status(200).json(successResponse('Cup record updated successfully', record))
+})
+
+// ── POST /api/v1/cups/:cupRecordId/refill ──────────────────────
+// Phase 1: one call = one refill event. Draft records only.
+// MUST be registered before /:cupRecordId in routes (same reason
+// as /finalize — prevents "refill" being captured as the id param).
+
+export const addRefill = asyncHandler(async (req, res) => {
+  const { isValid, errors } = validateAddRefill(req.body)
+  if (!isValid) {
+    return res.status(400).json(errorResponse('Validation failed', 400, errors))
+  }
+
+  const record = await addCupRefill(
+    req.tenantId,
+    req.params.cupRecordId,
+    req.body,
+    req.user.userId
+  )
+
+  return res.status(200).json(successResponse('Refill recorded successfully', record))
 })
 
 // ── PATCH /api/v1/cups/:cupRecordId/finalize ──────────────────

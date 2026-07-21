@@ -16,6 +16,7 @@ import mongoose  from 'mongoose'
 import CupRecord from '../../models/CupRecord.model.js'
 import Employee  from '../../models/Employee.model.js'
 import Product   from '../../models/Product.model.js'
+import Sale      from '../../models/Sale.model.js'
 import ApiError  from '../../utils/ApiError.js'
 import { validateFinalize } from './cup.validation.js'
 import { buildPaginationQuery, buildPaginationMeta } from '../../utils/pagination.js'
@@ -47,6 +48,129 @@ const addBalanceToItems = (items) =>
       balance: carried - accounted,
     }
   })
+
+// ── Phase 1: dispatch/refill log helpers ────────────────────────
+
+/**
+ * Sums the `quantity` field across a log array. Used to derive
+ * distributed/refill from dispatchLogs/refillLogs.
+ */
+const sumLog = (logs) => (logs ?? []).reduce((total, l) => total + (l.quantity ?? 0), 0)
+
+/**
+ * Builds a plain item object for create(), seeding dispatchLogs with
+ * one entry equal to the initial `distributed` amount (if > 0), so
+ * distributed always equals sum(dispatchLogs) from the moment a
+ * CupRecord is created (dispatch = creation, per the new business flow).
+ */
+const buildItemWithInitialDispatchLog = (item, userId) => {
+  const distributed = item.distributed ?? 0
+  const dispatchLogs = distributed > 0
+    ? [{ quantity: distributed, createdBy: new mongoose.Types.ObjectId(userId), createdAt: new Date() }]
+    : []
+
+  return {
+    productId:    new mongoose.Types.ObjectId(item.productId),
+    distributed,
+    refill:       item.refill ?? 0,
+    sold:         item.sold ?? 0,
+    returned:     item.returned ?? 0,
+    reject:       item.reject ?? 0,
+    dispatchLogs,
+    // If a non-zero refill is supplied directly at creation (legacy
+    // callers may do this), record it as a log too so refill stays
+    // derived from refillLogs.
+    refillLogs: (item.refill ?? 0) > 0
+      ? [{ quantity: item.refill, createdBy: new mongoose.Types.ObjectId(userId), createdAt: new Date(), notes: 'Set at creation' }]
+      : [],
+  }
+}
+
+/**
+ * Legacy PATCH /:id items[] replacement — overwrites the aggregate
+ * fields (distributed, refill, sold, returned, reject) exactly as
+ * requested, WITHOUT touching dispatchLogs/refillLogs.
+ *
+ * Delta fix: no synthetic "adjustment" log entries are manufactured
+ * here anymore. PATCH is legacy/emergency-correction only in the new
+ * workflow (dispatch/refill always go through their dedicated
+ * endpoints), so dispatchLogs/refillLogs must only ever contain real
+ * business events. Existing logs for a product (matched by productId)
+ * are carried over untouched; a brand-new product has empty logs,
+ * same as before Phase 1 existed.
+ *
+ * @param {Array} existingItems - record.items (subdocuments, pre-update)
+ * @param {Array} newItems      - data.items from request body
+ */
+const overwriteItemsPreservingLogs = (existingItems, newItems) => {
+  const existingByProduct = new Map(
+    (existingItems ?? []).map((i) => [i.productId.toString(), i])
+  )
+
+  return newItems.map((item) => {
+    const existing = existingByProduct.get(item.productId.toString())
+
+    return {
+      productId:    new mongoose.Types.ObjectId(item.productId),
+      distributed:  item.distributed ?? 0,
+      refill:       item.refill ?? 0,
+      sold:         item.sold ?? 0,
+      returned:     item.returned ?? 0,
+      reject:       item.reject ?? 0,
+      dispatchLogs: existing ? existing.dispatchLogs : [],
+      refillLogs:   existing ? existing.refillLogs : [],
+    }
+  })
+}
+
+/**
+ * Auto-generates (or idempotently updates) the Sale document for a
+ * just-finalized CupRecord. Revenue = sum(item.sold * Product.sellingPrice).
+ * Upserted by sourceCupRecordId so re-running is safe and it never
+ * collides with manually-entered Sale records for the same rider/date.
+ *
+ * Never throws to the caller in a way that would roll back the
+ * finalize itself in spirit — but per Phase 1 scope we let errors
+ * surface normally since Sale generation is part of the finalize
+ * contract now (matches the requirement "Sales become system-generated").
+ *
+ * @param {Object} record - the finalized CupRecord (mongoose doc, plain items ok)
+ * @param {string} userId - who finalized (becomes recordedBy)
+ */
+const generateSaleFromCupRecord = async (record, userId) => {
+  const productIds = record.items.map((i) => i.productId)
+  const products    = await Product.find({ _id: { $in: productIds } }).lean()
+  const priceMap     = new Map(products.map((p) => [p._id.toString(), p.sellingPrice ?? 0]))
+
+  let totalCups    = 0
+  let totalRevenue = 0
+
+  for (const item of record.items) {
+    const sold  = item.sold ?? 0
+    const price = priceMap.get(item.productId.toString()) ?? 0
+    totalCups    += sold
+    totalRevenue += sold * price
+  }
+
+  await Sale.findOneAndUpdate(
+    { sourceCupRecordId: record._id },
+    {
+      $set: {
+        tenantId:          record.tenantId,
+        outletId:          record.outletId,
+        employeeId:        record.riderId,
+        date:              record.date,
+        totalCups,
+        totalRevenue,
+        origin:            'system',
+        sourceCupRecordId: record._id,
+        recordedBy:        new mongoose.Types.ObjectId(userId),
+        notes:             'Auto-generated from CupRecord finalize',
+      },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  )
+}
 
 // ── createCupRecord ───────────────────────────────────────────
 
@@ -81,15 +205,10 @@ export const createCupRecord = async (tenantId, outletId, data, userId) => {
   // Determine outletId — from rider's outletId (more reliable than body)
   const recordOutletId = rider.outletId ?? new mongoose.Types.ObjectId(outletId)
 
-  // Build items — normalize all numeric fields to integers, default 0
-  const items = data.items.map((item) => ({
-    productId:   new mongoose.Types.ObjectId(item.productId),
-    distributed: item.distributed ?? 0,
-    refill:      item.refill      ?? 0,
-    sold:        item.sold        ?? 0,
-    returned:    item.returned    ?? 0,
-    reject:      item.reject      ?? 0,
-  }))
+  // Build items — normalize all numeric fields to integers, default 0.
+  // Phase 1: dispatch = creation, so seed dispatchLogs (and refillLogs,
+  // if a non-zero refill is supplied directly) for audit trail purposes.
+  const items = data.items.map((item) => buildItemWithInitialDispatchLog(item, userId))
 
   try {
     const record = await CupRecord.create({
@@ -219,14 +338,12 @@ export const updateCupRecord = async (tenantId, cupRecordId, data, userId) => {
   }
 
   if (data.items !== undefined) {
-    record.items = data.items.map((item) => ({
-      productId:   new mongoose.Types.ObjectId(item.productId),
-      distributed: item.distributed ?? 0,
-      refill:      item.refill      ?? 0,
-      sold:        item.sold        ?? 0,
-      returned:    item.returned    ?? 0,
-      reject:      item.reject      ?? 0,
-    }))
+    // Delta fix: PATCH is legacy/emergency-correction only — it must
+    // NEVER manufacture dispatchLogs/refillLogs entries. Existing real
+    // log history (if any, matched by productId) is preserved as-is;
+    // only the aggregate distributed/refill/sold/returned/reject fields
+    // are overwritten, exactly like the pre-Phase-1 behavior.
+    record.items = overwriteItemsPreservingLogs(record.items, data.items)
   }
 
   if (data.notes !== undefined) {
@@ -235,6 +352,64 @@ export const updateCupRecord = async (tenantId, cupRecordId, data, userId) => {
 
   record.recordedBy = new mongoose.Types.ObjectId(userId)
 
+  await record.save()
+
+  return {
+    ...record.toObject(),
+    items: addBalanceToItems(record.toObject().items),
+  }
+}
+
+// ── addCupRefill ─────────────────────────────────────────────
+//
+// Phase 1: appends a refill log entry per product to a DRAFT record.
+// A rider can be refilled multiple times a day — each call to this
+// endpoint is one refill event (Dispatch → Refill 1 → Refill 2 → ...).
+// item.refill is recomputed as sum(refillLogs) after each append.
+
+/**
+ * @param {string} tenantId
+ * @param {string} cupRecordId
+ * @param {Object} data - validated req.body { items: [{ productId, quantity, notes? }] }
+ * @param {string} userId
+ */
+export const addCupRefill = async (tenantId, cupRecordId, data, userId) => {
+  const record = await CupRecord.findOne({
+    _id:      new mongoose.Types.ObjectId(cupRecordId),
+    tenantId: new mongoose.Types.ObjectId(tenantId),
+  })
+
+  if (!record) throw new ApiError(404, 'Cup record not found')
+
+  if (record.status === 'finalized') {
+    throw new ApiError(409, 'This cup record has been finalized and cannot be refilled.')
+  }
+
+  const itemsByProduct = new Map(
+    record.items.map((item) => [item.productId.toString(), item])
+  )
+
+  for (const refillInput of data.items) {
+    const item = itemsByProduct.get(refillInput.productId)
+
+    if (!item) {
+      throw new ApiError(
+        400,
+        `Product ${refillInput.productId} is not part of this cup record. Refill can only apply to products already dispatched.`
+      )
+    }
+
+    item.refillLogs.push({
+      quantity:  refillInput.quantity,
+      createdBy: new mongoose.Types.ObjectId(userId),
+      createdAt: new Date(),
+      notes:     refillInput.notes?.trim() ?? null,
+    })
+
+    item.refill = sumLog(item.refillLogs)
+  }
+
+  record.recordedBy = new mongoose.Types.ObjectId(userId)
   await record.save()
 
   return {
@@ -293,6 +468,13 @@ export const finalizeCupRecord = async (tenantId, cupRecordId, userId) => {
   record.finalizedBy = new mongoose.Types.ObjectId(userId)
   record.finalizedAt = new Date()
   await record.save()
+
+  // Phase 1: automatic Sale generation. Revenue = sold * Product.sellingPrice.
+  // Upserted by sourceCupRecordId — idempotent, never touches manually
+  // entered Sale records. Dashboard/Payroll are unchanged — they already
+  // aggregate over the Sale collection, so this record is picked up
+  // automatically the next time they run.
+  await generateSaleFromCupRecord(record.toObject(), userId)
 
   return {
     ...record.toObject(),

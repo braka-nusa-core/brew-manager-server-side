@@ -29,6 +29,7 @@ import {
   getAll,
   getOne,
   update,
+  addRefill,
   finalize,
   remove,
   reconciliation,
@@ -60,6 +61,17 @@ router.get(
   '/reconciliation',
   authorize(PERMISSIONS.VIEW_CUPS, PERMISSIONS.MANAGE_CUPS),
   reconciliation
+)
+
+// ── POST /api/v1/cups/:cupRecordId/refill ──────────────────────
+// MUST be before /:cupRecordId — prevents "refill" being
+// captured as a cupRecordId param value.
+// One call = one refill event; draft records only (enforced in service).
+router.post(
+  '/:cupRecordId/refill',
+  validateObjectId('cupRecordId'),
+  authorize(PERMISSIONS.MANAGE_CUPS),
+  addRefill
 )
 
 // ── PATCH /api/v1/cups/:cupRecordId/finalize ──────────────────

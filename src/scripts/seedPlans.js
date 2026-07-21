@@ -21,9 +21,9 @@
 
 import mongoose    from 'mongoose'
 import dotenv      from 'dotenv'
-import Plan        from '../src/models/Plan.model.js'
-import Subscription from '../src/models/Subscription.model.js'
-import Tenant      from '../src/models/Tenant.model.js'
+import Plan        from '../models/Plan.model.js'
+import Subscription from '../models/Subscription.model.js'
+import Tenant      from '../models/Tenant.model.js'
 
 dotenv.config()
 
@@ -130,7 +130,7 @@ const PLANS = [
 ]
 
 const seed = async () => {
-  const uri = process.env.MONGODB_URI
+  const uri = process.env.MONGO_URI
   if (!uri) {
     console.error('❌  MONGODB_URI is not set. Create a .env file or export the variable.')
     process.exit(1)

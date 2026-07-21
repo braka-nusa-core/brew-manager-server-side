@@ -10,7 +10,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "lint": "eslint src --ext .js"
+    "lint": "eslint src --ext .js",
+    "seed:superadmin": "node src/scripts/seedSuperAdmin.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

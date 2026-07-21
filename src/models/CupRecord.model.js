@@ -25,6 +25,39 @@ const { Schema, model } = mongoose
 
 export const CUP_RECORD_STATUSES = ['draft', 'finalized']
 
+// ── Embedded log schema (Phase 1: audit trail for dispatch/refill) ──
+//
+// Each entry represents a single dispatch or refill event.
+// distributed/refill on cupItemSchema are DERIVED — they always equal
+// sum(dispatchLogs.quantity) / sum(refillLogs.quantity). They are kept
+// as stored fields (not virtuals) for backward compatibility with
+// existing API responses and queries.
+
+const cupLogEntrySchema = new Schema(
+  {
+    quantity: {
+      type:     Number,
+      required: [true, 'quantity is required'],
+      min:      [0, 'quantity cannot be negative'],
+    },
+    createdBy: {
+      type:     Schema.Types.ObjectId,
+      ref:      'User',
+      required: [true, 'createdBy (userId) is required'],
+    },
+    createdAt: {
+      type:    Date,
+      default: Date.now,
+    },
+    notes: {
+      type:    String,
+      trim:    true,
+      default: null,
+    },
+  },
+  { _id: false }
+)
+
 // ── Embedded item schema ──────────────────────────────────────
 
 const cupItemSchema = new Schema(
@@ -36,6 +69,8 @@ const cupItemSchema = new Schema(
     },
 
     // Cups given out to rider at start of day
+    // DERIVED: sum(dispatchLogs.quantity). Kept as stored field for
+    // backward compatibility — existing API consumers still read this.
     distributed: {
       type:    Number,
       default: 0,
@@ -43,10 +78,26 @@ const cupItemSchema = new Schema(
     },
 
     // Additional cups given during the day (separate refill event)
+    // DERIVED: sum(refillLogs.quantity). Kept as stored field for
+    // backward compatibility — existing API consumers still read this.
     refill: {
       type:    Number,
       default: 0,
       min:     [0, 'refill cannot be negative'],
+    },
+
+    // Phase 1: audit trail. Each dispatch (including the initial one at
+    // record creation) appends one entry here. distributed = sum of these.
+    dispatchLogs: {
+      type:    [cupLogEntrySchema],
+      default: [],
+    },
+
+    // Phase 1: audit trail. Each refill event (rider can refill multiple
+    // times per day) appends one entry here. refill = sum of these.
+    refillLogs: {
+      type:    [cupLogEntrySchema],
+      default: [],
     },
 
     // Cups confirmed sold to customers

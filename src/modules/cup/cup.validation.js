@@ -128,6 +128,47 @@ export const validateUpdateCupRecord = (body) => {
   return { isValid: errors.length === 0, errors }
 }
 
+// ── validateAddRefill ─────────────────────────────────────────
+//
+// Phase 1: validates body for POST /:cupRecordId/refill.
+// Each entry is one refill event for one product; quantity must be
+// a positive integer (0 doesn't make sense as a refill event).
+
+export const validateAddRefill = (body) => {
+  const errors = []
+  const { items } = body
+
+  if (!Array.isArray(items) || items.length === 0) {
+    errors.push('items must be a non-empty array')
+    return { isValid: false, errors }
+  }
+
+  items.forEach((item, i) => {
+    if (!item || typeof item !== 'object') {
+      errors.push(`items[${i}]: must be an object`)
+      return
+    }
+
+    if (!item.productId) {
+      errors.push(`items[${i}]: productId is required`)
+    } else if (!isValidObjectId(item.productId)) {
+      errors.push(`items[${i}]: productId must be a valid ObjectId`)
+    }
+
+    if (item.quantity === undefined || item.quantity === null) {
+      errors.push(`items[${i}]: quantity is required`)
+    } else if (!isNonNegativeInt(item.quantity) || item.quantity === 0) {
+      errors.push(`items[${i}]: quantity must be a positive integer`)
+    }
+
+    if (item.notes !== undefined && item.notes !== null && typeof item.notes !== 'string') {
+      errors.push(`items[${i}]: notes must be a string`)
+    }
+  })
+
+  return { isValid: errors.length === 0, errors }
+}
+
 // ── validateFinalize ──────────────────────────────────────────
 
 /**
