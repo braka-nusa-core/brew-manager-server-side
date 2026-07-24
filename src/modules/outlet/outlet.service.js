@@ -91,14 +91,26 @@ export const createOutlet = async (tenantId, data) => {
   const outletCode = await generateOutletCode(tenantOid, data.name, data.code)
 
   try {
-    const outlet = await Outlet.create({
+    const createData = {
       tenantId: tenantOid,
       name:     data.name.trim(),
       code:     outletCode,
       address:  data.address?.trim() ?? null,
       phone:    data.phone?.trim()   ?? null,
       isActive: true,
-    })
+    }
+
+    // ── Payroll configuration (Phase 1 fields) ────────────────
+    // Only set if provided — omitted fields fall through to the
+    // schema's own defaults ('fixed' / 0 / 0 / 0 / []), same as
+    // before this fix. Mirrors updateOutlet()'s field mapping.
+    if (data.payrollType           !== undefined) createData.payrollType           = data.payrollType
+    if (data.commissionPercentage  !== undefined) createData.commissionPercentage  = data.commissionPercentage
+    if (data.mealAllowancePerDay   !== undefined) createData.mealAllowancePerDay   = data.mealAllowancePerDay
+    if (data.weeklyAttendanceBonus !== undefined) createData.weeklyAttendanceBonus = data.weeklyAttendanceBonus
+    if (data.bonusRules            !== undefined) createData.bonusRules            = data.bonusRules
+
+    const outlet = await Outlet.create(createData)
 
     return outlet.toObject()
   } catch (err) {
