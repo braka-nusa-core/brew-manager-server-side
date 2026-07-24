@@ -32,6 +32,29 @@ export const CUP_RECORD_STATUSES = ['draft', 'finalized']
 // sum(dispatchLogs.quantity) / sum(refillLogs.quantity). They are kept
 // as stored fields (not virtuals) for backward compatibility with
 // existing API responses and queries.
+//
+// Sprint 6.1: sourceBatches is OPTIONAL and additive — it records which
+// InventoryBatch(es) FIFO consumption drew this quantity from (a single
+// event can span multiple batches if the oldest one alone isn't enough).
+// Absent/empty on pre-Sprint-6.1 records and on any log entry created
+// through a path that doesn't touch inventory — existing balance-check
+// math and API responses are unaffected either way.
+
+const sourceBatchSchema = new Schema(
+  {
+    batchId: {
+      type:     Schema.Types.ObjectId,
+      ref:      'InventoryBatch',
+      required: [true, 'batchId is required in a sourceBatches entry'],
+    },
+    quantity: {
+      type:     Number,
+      required: [true, 'quantity is required in a sourceBatches entry'],
+      min:      [1, 'quantity must be at least 1'],
+    },
+  },
+  { _id: false }
+)
 
 const cupLogEntrySchema = new Schema(
   {
@@ -53,6 +76,13 @@ const cupLogEntrySchema = new Schema(
       type:    String,
       trim:    true,
       default: null,
+    },
+    // Sprint 6.1 — optional. Which InventoryBatch(es) FIFO drew from to
+    // fulfill this dispatch/refill quantity. Empty/absent for pre-6.1
+    // records or if inventory tracking wasn't engaged for this event.
+    sourceBatches: {
+      type:    [sourceBatchSchema],
+      default: [],
     },
   },
   { _id: false }

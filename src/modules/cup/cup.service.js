@@ -20,6 +20,11 @@ import Sale      from '../../models/Sale.model.js'
 import ApiError  from '../../utils/ApiError.js'
 import { validateFinalize } from './cup.validation.js'
 import { buildPaginationQuery, buildPaginationMeta } from '../../utils/pagination.js'
+import {
+  consumeFifo,
+  applyReturnAndReject,
+  flattenSourceBatches,
+} from '../inventory/inventory.service.js'
 
 // ── Helpers ───────────────────────────────────────────────────
 
@@ -62,11 +67,25 @@ const sumLog = (logs) => (logs ?? []).reduce((total, l) => total + (l.quantity ?
  * one entry equal to the initial `distributed` amount (if > 0), so
  * distributed always equals sum(dispatchLogs) from the moment a
  * CupRecord is created (dispatch = creation, per the new business flow).
+ *
+ * Sprint 6.1: accepts the FIFO consumption breakdown (already committed
+ * by the caller via consumeFifo) so it can be attached to the log entry
+ * as sourceBatches — purely additive, does not change dispatchLogs/
+ * refillLogs shape for callers that don't pass any.
  */
-const buildItemWithInitialDispatchLog = (item, userId) => {
+const buildItemWithInitialDispatchLog = (
+  item,
+  userId,
+  { dispatchSourceBatches = [], refillSourceBatches = [] } = {}
+) => {
   const distributed = item.distributed ?? 0
   const dispatchLogs = distributed > 0
-    ? [{ quantity: distributed, createdBy: new mongoose.Types.ObjectId(userId), createdAt: new Date() }]
+    ? [{
+        quantity: distributed,
+        createdBy: new mongoose.Types.ObjectId(userId),
+        createdAt: new Date(),
+        sourceBatches: dispatchSourceBatches,
+      }]
     : []
 
   return {
@@ -81,7 +100,13 @@ const buildItemWithInitialDispatchLog = (item, userId) => {
     // callers may do this), record it as a log too so refill stays
     // derived from refillLogs.
     refillLogs: (item.refill ?? 0) > 0
-      ? [{ quantity: item.refill, createdBy: new mongoose.Types.ObjectId(userId), createdAt: new Date(), notes: 'Set at creation' }]
+      ? [{
+          quantity: item.refill,
+          createdBy: new mongoose.Types.ObjectId(userId),
+          createdAt: new Date(),
+          notes: 'Set at creation',
+          sourceBatches: refillSourceBatches,
+        }]
       : [],
   }
 }
@@ -129,17 +154,19 @@ const overwriteItemsPreservingLogs = (existingItems, newItems) => {
  * Upserted by sourceCupRecordId so re-running is safe and it never
  * collides with manually-entered Sale records for the same rider/date.
  *
- * Never throws to the caller in a way that would roll back the
- * finalize itself in spirit — but per Phase 1 scope we let errors
- * surface normally since Sale generation is part of the finalize
- * contract now (matches the requirement "Sales become system-generated").
+ * Sprint 6.2: MUST be called from inside the same session transaction as
+ * the rest of finalizeCupRecord — every query/write here is threaded
+ * through `session` so Sale generation commits or rolls back together
+ * with balance validation, inventory application, and the CupRecord
+ * status transition as a single atomic unit.
  *
+ * @param {import('mongoose').ClientSession} session
  * @param {Object} record - the finalized CupRecord (mongoose doc, plain items ok)
  * @param {string} userId - who finalized (becomes recordedBy)
  */
-const generateSaleFromCupRecord = async (record, userId) => {
+const generateSaleFromCupRecord = async (session, record, userId) => {
   const productIds = record.items.map((i) => i.productId)
-  const products    = await Product.find({ _id: { $in: productIds } }).lean()
+  const products    = await Product.find({ _id: { $in: productIds } }).session(session).lean()
   const priceMap     = new Map(products.map((p) => [p._id.toString(), p.sellingPrice ?? 0]))
 
   let totalCups    = 0
@@ -168,7 +195,7 @@ const generateSaleFromCupRecord = async (record, userId) => {
         notes:             'Auto-generated from CupRecord finalize',
       },
     },
-    { upsert: true, new: true, setDefaultsOnInsert: true }
+    { upsert: true, new: true, setDefaultsOnInsert: true, session }
   )
 }
 
@@ -177,6 +204,15 @@ const generateSaleFromCupRecord = async (record, userId) => {
 /**
  * Creates a new CupRecord in draft status.
  * Validates that riderId belongs to an active rider in the tenant.
+ *
+ * Sprint 6.2: the entire operation — rider/duplicate checks, FIFO
+ * consumption, InventoryTransaction creation, InventoryBatch updates, and
+ * CupRecord creation — runs inside a single mongoose session transaction.
+ * Any failure at any step aborts the whole transaction; no partial state
+ * (consumed inventory without a persisted CupRecord, or vice versa) can
+ * ever remain. This replaces Sprint 6.1's application-level compensation
+ * (pre-generated _id + manual rollback on failure), which is no longer
+ * needed and has been removed.
  *
  * @param {string} tenantId - from req.tenantId
  * @param {string} outletId - from req.outletId or req.body
@@ -187,46 +223,89 @@ export const createCupRecord = async (tenantId, outletId, data, userId) => {
   const tenantOid = new mongoose.Types.ObjectId(tenantId)
   const date      = toMidnightUTC(data.date)
 
-  // [CR6] Verify rider exists in tenant and has isRider: true
-  const rider = await Employee.findOne({
-    _id:      new mongoose.Types.ObjectId(data.riderId),
-    tenantId: tenantOid,
-    isRider:  true,
-    isActive: true,
-  }).lean()
-
-  if (!rider) {
-    throw new ApiError(
-      404,
-      'Rider not found. Ensure the employee exists, is active, and has employeeType "rider".'
-    )
-  }
-
-  // Determine outletId — from rider's outletId (more reliable than body)
-  const recordOutletId = rider.outletId ?? new mongoose.Types.ObjectId(outletId)
-
-  // Build items — normalize all numeric fields to integers, default 0.
-  // Phase 1: dispatch = creation, so seed dispatchLogs (and refillLogs,
-  // if a non-zero refill is supplied directly) for audit trail purposes.
-  const items = data.items.map((item) => buildItemWithInitialDispatchLog(item, userId))
+  const session = await mongoose.startSession()
+  let result
 
   try {
-    const record = await CupRecord.create({
-      tenantId:   tenantOid,
-      outletId:   recordOutletId,
-      riderId:    new mongoose.Types.ObjectId(data.riderId),
-      date,
-      items,
-      notes:      data.notes?.trim() ?? null,
-      status:     'draft',
-      recordedBy: new mongoose.Types.ObjectId(userId),
+    await session.withTransaction(async () => {
+      // [CR6] Verify rider exists in tenant and has isRider: true
+      const rider = await Employee.findOne({
+        _id:      new mongoose.Types.ObjectId(data.riderId),
+        tenantId: tenantOid,
+        isRider:  true,
+        isActive: true,
+      }).session(session).lean()
+
+      if (!rider) {
+        throw new ApiError(
+          404,
+          'Rider not found. Ensure the employee exists, is active, and has employeeType "rider".'
+        )
+      }
+
+      // Determine outletId — from rider's outletId (more reliable than body)
+      const recordOutletId = rider.outletId ?? new mongoose.Types.ObjectId(outletId)
+
+      const existing = await CupRecord.findOne({ tenantId: tenantOid, riderId: rider._id, date })
+        .session(session)
+        .lean()
+
+      if (existing) {
+        throw new ApiError(
+          409,
+          `A cup record for this rider on ${date.toISOString().split('T')[0]} already exists`
+        )
+      }
+
+      // Pre-generate the CupRecord's _id so FIFO consumption can be linked
+      // to it (via cupRecordId on InventoryTransaction) even though the
+      // CupRecord document itself is created after consumption below.
+      // Safe under a transaction: if anything downstream fails, the whole
+      // transaction — including this _id ever having existed — is discarded.
+      const cupRecordId = new mongoose.Types.ObjectId()
+
+      const items = []
+      for (const item of data.items) {
+        const distributed = item.distributed ?? 0
+        const refill       = item.refill ?? 0
+
+        const dispatchSourceBatches = distributed > 0
+          ? await consumeFifo(session, {
+              tenantId, outletId: recordOutletId, productId: item.productId,
+              quantity: distributed, type: 'dispatch', cupRecordId, userId,
+            })
+          : []
+
+        const refillSourceBatches = refill > 0
+          ? await consumeFifo(session, {
+              tenantId, outletId: recordOutletId, productId: item.productId,
+              quantity: refill, type: 'refill', cupRecordId, userId,
+              notes: 'Set at creation',
+            })
+          : []
+
+        items.push(buildItemWithInitialDispatchLog(item, userId, { dispatchSourceBatches, refillSourceBatches }))
+      }
+
+      const created = await CupRecord.create([{
+        _id:        cupRecordId,
+        tenantId:   tenantOid,
+        outletId:   recordOutletId,
+        riderId:    rider._id,
+        date,
+        items,
+        notes:      data.notes?.trim() ?? null,
+        status:     'draft',
+        recordedBy: new mongoose.Types.ObjectId(userId),
+      }], { session })
+
+      const record = created[0]
+
+      result = {
+        ...record.toObject(),
+        items: addBalanceToItems(record.toObject().items),
+      }
     })
-
-    return {
-      ...record.toObject(),
-      items: addBalanceToItems(record.toObject().items),
-    }
-
   } catch (err) {
     if (err.code === 11000) {
       throw new ApiError(
@@ -235,7 +314,11 @@ export const createCupRecord = async (tenantId, outletId, data, userId) => {
       )
     }
     throw err
+  } finally {
+    await session.endSession()
   }
+
+  return result
 }
 
 // ── getCupRecords ─────────────────────────────────────────────
@@ -372,50 +455,84 @@ export const updateCupRecord = async (tenantId, cupRecordId, data, userId) => {
  * @param {string} cupRecordId
  * @param {Object} data - validated req.body { items: [{ productId, quantity, notes? }] }
  * @param {string} userId
+ *
+ * Sprint 6.2: FIFO consumption, InventoryTransaction creation, InventoryBatch
+ * updates, and the CupRecord refill-log update all run inside a single
+ * mongoose session transaction. Any failure — including a later product in
+ * a multi-product refill request failing after an earlier one already
+ * consumed inventory — aborts the whole transaction, so no partial state
+ * remains. This replaces Sprint 6.1's application-level compensation
+ * (scoped rollback of just-this-call's transactions), which is no longer
+ * needed and has been removed.
  */
 export const addCupRefill = async (tenantId, cupRecordId, data, userId) => {
-  const record = await CupRecord.findOne({
-    _id:      new mongoose.Types.ObjectId(cupRecordId),
-    tenantId: new mongoose.Types.ObjectId(tenantId),
-  })
+  const session = await mongoose.startSession()
+  let result
 
-  if (!record) throw new ApiError(404, 'Cup record not found')
+  try {
+    await session.withTransaction(async () => {
+      const record = await CupRecord.findOne({
+        _id:      new mongoose.Types.ObjectId(cupRecordId),
+        tenantId: new mongoose.Types.ObjectId(tenantId),
+      }).session(session)
 
-  if (record.status === 'finalized') {
-    throw new ApiError(409, 'This cup record has been finalized and cannot be refilled.')
-  }
+      if (!record) throw new ApiError(404, 'Cup record not found')
 
-  const itemsByProduct = new Map(
-    record.items.map((item) => [item.productId.toString(), item])
-  )
+      if (record.status === 'finalized') {
+        throw new ApiError(409, 'This cup record has been finalized and cannot be refilled.')
+      }
 
-  for (const refillInput of data.items) {
-    const item = itemsByProduct.get(refillInput.productId)
-
-    if (!item) {
-      throw new ApiError(
-        400,
-        `Product ${refillInput.productId} is not part of this cup record. Refill can only apply to products already dispatched.`
+      const itemsByProduct = new Map(
+        record.items.map((item) => [item.productId.toString(), item])
       )
-    }
 
-    item.refillLogs.push({
-      quantity:  refillInput.quantity,
-      createdBy: new mongoose.Types.ObjectId(userId),
-      createdAt: new Date(),
-      notes:     refillInput.notes?.trim() ?? null,
+      // Validate all products exist on the record first (unchanged check)
+      for (const refillInput of data.items) {
+        if (!itemsByProduct.has(refillInput.productId)) {
+          throw new ApiError(
+            400,
+            `Product ${refillInput.productId} is not part of this cup record. Refill can only apply to products already dispatched.`
+          )
+        }
+      }
+
+      // FIFO consumption per product, attach sourceBatches to the refill
+      // log entry. Any consumeFifo failure here throws and aborts the
+      // whole transaction — earlier products' consumption in this same
+      // loop is discarded automatically along with everything else.
+      for (const refillInput of data.items) {
+        const item = itemsByProduct.get(refillInput.productId)
+
+        const consumed = await consumeFifo(session, {
+          tenantId, outletId: record.outletId, productId: refillInput.productId,
+          quantity: refillInput.quantity, type: 'refill', cupRecordId: record._id, userId,
+          notes: refillInput.notes?.trim() || undefined,
+        })
+
+        item.refillLogs.push({
+          quantity:  refillInput.quantity,
+          createdBy: new mongoose.Types.ObjectId(userId),
+          createdAt: new Date(),
+          notes:     refillInput.notes?.trim() ?? null,
+          sourceBatches: consumed,
+        })
+
+        item.refill = sumLog(item.refillLogs)
+      }
+
+      record.recordedBy = new mongoose.Types.ObjectId(userId)
+      await record.save({ session })
+
+      result = {
+        ...record.toObject(),
+        items: addBalanceToItems(record.toObject().items),
+      }
     })
-
-    item.refill = sumLog(item.refillLogs)
+  } finally {
+    await session.endSession()
   }
 
-  record.recordedBy = new mongoose.Types.ObjectId(userId)
-  await record.save()
-
-  return {
-    ...record.toObject(),
-    items: addBalanceToItems(record.toObject().items),
-  }
+  return result
 }
 
 // ── finalizeCupRecord ─────────────────────────────────────────
@@ -428,59 +545,119 @@ export const addCupRefill = async (tenantId, cupRecordId, data, userId) => {
  *
  * ALL items must balance. Returns 400 with detailed breakdown if any fail.
  *
+ * Sprint 6.2: runs as ONE mongoose session transaction, in this exact order:
+ *   1. Validate balances
+ *   2-4. Apply return/reject inventory (InventoryTransaction + InventoryBatch updates)
+ *   5. Generate/upsert Sale
+ *   6-7. Mark CupRecord finalized + save
+ *   8. Commit
+ * Any failure at any step aborts the whole transaction — no partial state
+ * (inventory applied without Sale, Sale generated without finalize, etc.)
+ * can ever remain. This replaces the try/catch ordering used in Sprint 6.1's
+ * Revision 1/2 (manual sequencing, no rollback), which is superseded by
+ * real transactional atomicity — no manual rollback logic remains here.
+ *
  * @param {string} tenantId
  * @param {string} cupRecordId
  * @param {string} userId - who is finalizing
  */
 export const finalizeCupRecord = async (tenantId, cupRecordId, userId) => {
-  const record = await CupRecord.findOne({
-    _id:      new mongoose.Types.ObjectId(cupRecordId),
-    tenantId: new mongoose.Types.ObjectId(tenantId),
-  })
+  const session = await mongoose.startSession()
+  let result
 
-  if (!record) throw new ApiError(404, 'Cup record not found')
+  try {
+    await session.withTransaction(async () => {
+      const record = await CupRecord.findOne({
+        _id:      new mongoose.Types.ObjectId(cupRecordId),
+        tenantId: new mongoose.Types.ObjectId(tenantId),
+      }).session(session)
 
-  if (record.status === 'finalized') {
-    throw new ApiError(409, 'Cup record is already finalized')
+      if (!record) throw new ApiError(404, 'Cup record not found')
+
+      if (record.status === 'finalized') {
+        throw new ApiError(409, 'Cup record is already finalized')
+      }
+
+      // Build productId → name lookup for readable error messages
+      const productIds = record.items.map((i) => i.productId)
+      const products   = await Product.find({
+        _id: { $in: productIds },
+      }).session(session).lean()
+      const productNameMap = new Map(products.map((p) => [p._id.toString(), p.name]))
+
+      const getProductName = (id) => productNameMap.get(id) ?? id
+
+      // ── Step 1: Validate balance for all items ──
+      const { isValid, errors, breakdown } = validateFinalize(
+        record.toObject().items,
+        getProductName
+      )
+
+      if (!isValid) {
+        throw new ApiError(400, errors.join('\n'), errors)
+      }
+
+      // ── Steps 2-4: Apply return/reject inventory transactions + batch updates ──
+      // Credits returned / debits rejected units back onto the ORIGINAL
+      // InventoryBatch(es) each item's dispatch/refill logs recorded as
+      // sourceBatches. No new batch is ever created here (see
+      // inventory.service.js: applyReturnAndReject). If an item has no
+      // recorded sourceBatches at all (e.g. a pre-Sprint-6.1 draft still
+      // in flight at deploy time, or a product whose distributed/refill
+      // was only ever set via the legacy PATCH override path — which
+      // never engages FIFO by design), inventory movement is simply
+      // skipped for that item rather than blocking finalize — preserving
+      // backward compatibility for already-in-flight records. Every
+      // dispatch/refill going forward always has sourceBatches
+      // (consumeFifo enforces this), so this gap only affects the
+      // transition window, not new data.
+      //
+      // Any error here throws and aborts the WHOLE transaction — nothing
+      // (balance validation having passed, inventory partially applied)
+      // persists.
+      for (const item of record.toObject().items) {
+        const sourceBatches = flattenSourceBatches(item)
+        if (sourceBatches.length === 0) continue
+
+        await applyReturnAndReject(session, {
+          sourceBatches,
+          returnQty:   item.returned ?? 0,
+          rejectQty:   item.reject ?? 0,
+          tenantId:    record.tenantId,
+          outletId:    record.outletId,
+          productId:   item.productId,
+          cupRecordId: record._id,
+          userId,
+        })
+      }
+
+      // ── Step 5: Generate / upsert Sale ──
+      // Revenue = sold * Product.sellingPrice. Upserted by sourceCupRecordId
+      // — idempotent, never touches manually entered Sale records.
+      // Dashboard/Payroll are unchanged — they already aggregate over the
+      // Sale collection, so this record is picked up automatically the
+      // next time they run. Content doesn't depend on record.status, so
+      // it's safe to generate before the status flip below.
+      await generateSaleFromCupRecord(session, record.toObject(), userId)
+
+      // ── Steps 6-7: Mark CupRecord finalized + save ──
+      record.status      = 'finalized'
+      record.finalizedBy = new mongoose.Types.ObjectId(userId)
+      record.finalizedAt = new Date()
+      await record.save({ session })
+
+      result = {
+        ...record.toObject(),
+        items: addBalanceToItems(record.toObject().items),
+        reconciliationBreakdown: breakdown,
+      }
+      // ── Step 8: Commit — handled by session.withTransaction on success ──
+    })
+  } finally {
+    await session.endSession()
   }
 
-  // Build productId → name lookup for readable error messages
-  const productIds = record.items.map((i) => i.productId)
-  const products   = await Product.find({
-    _id: { $in: productIds },
-  }).lean()
-  const productNameMap = new Map(products.map((p) => [p._id.toString(), p.name]))
-
-  const getProductName = (id) => productNameMap.get(id) ?? id
-
-  // Validate balance for all items
-  const { isValid, errors, breakdown } = validateFinalize(
-    record.toObject().items,
-    getProductName
-  )
-
-  if (!isValid) {
-    throw new ApiError(400, errors.join('\n'), errors)
-  }
-
-  // All balanced — finalize
-  record.status      = 'finalized'
-  record.finalizedBy = new mongoose.Types.ObjectId(userId)
-  record.finalizedAt = new Date()
-  await record.save()
-
-  // Phase 1: automatic Sale generation. Revenue = sold * Product.sellingPrice.
-  // Upserted by sourceCupRecordId — idempotent, never touches manually
-  // entered Sale records. Dashboard/Payroll are unchanged — they already
-  // aggregate over the Sale collection, so this record is picked up
-  // automatically the next time they run.
-  await generateSaleFromCupRecord(record.toObject(), userId)
-
-  return {
-    ...record.toObject(),
-    items: addBalanceToItems(record.toObject().items),
-    reconciliationBreakdown: breakdown,
-  }
+  return result
 }
 
 // ── deleteCupRecord ───────────────────────────────────────────

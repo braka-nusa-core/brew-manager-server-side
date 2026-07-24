@@ -64,6 +64,10 @@ export const PERMISSIONS = {
   MANAGE_RAW_MATERIALS: 'manage:raw_materials',
   VIEW_RAW_MATERIALS:   'view:raw_materials',
 
+  // Inventory / Production Batches (Sprint 6.2 addition)
+  MANAGE_INVENTORY: 'manage:inventory',
+  VIEW_INVENTORY:   'view:inventory',
+
   // Bikes (Phase 6B addition)
   MANAGE_BIKES: 'manage:bikes',
   VIEW_BIKES:   'view:bikes',
@@ -105,6 +109,9 @@ export const ROLE_PERMISSIONS = {
     PERMISSIONS.VIEW_RAW_MATERIALS,
     PERMISSIONS.MANAGE_BIKES,
     PERMISSIONS.VIEW_BIKES,
+    // Sprint 6.2 — production batch management
+    PERMISSIONS.MANAGE_INVENTORY,
+    PERMISSIONS.VIEW_INVENTORY,
     // Sprint 2 — can view own subscription, submit upgrade requests
     PERMISSIONS.VIEW_SUBSCRIPTIONS,
     PERMISSIONS.MANAGE_UPGRADE_REQUESTS,
@@ -131,6 +138,9 @@ export const ROLE_PERMISSIONS = {
     PERMISSIONS.VIEW_RAW_MATERIALS,
     PERMISSIONS.MANAGE_BIKES,
     PERMISSIONS.VIEW_BIKES,
+    // Sprint 6.2 — production batch management
+    PERMISSIONS.MANAGE_INVENTORY,
+    PERMISSIONS.VIEW_INVENTORY,
   ],
 
   // Cashier: NO attendance access — attendance is manager/admin only.
@@ -144,6 +154,10 @@ export const ROLE_PERMISSIONS = {
     PERMISSIONS.VIEW_CUPS,
     PERMISSIONS.VIEW_RAW_MATERIALS,
     PERMISSIONS.VIEW_BIKES,
+    // Sprint 6.2 — cashiers dispatch cups (which consume inventory
+    // internally via Cup service) but do not create production batches,
+    // mirroring the existing VIEW_PRODUCTS-only (no MANAGE_PRODUCTS) pattern.
+    PERMISSIONS.VIEW_INVENTORY,
   ],
 
   // Viewer: read-only, outlet-scoped.
@@ -161,5 +175,7 @@ export const ROLE_PERMISSIONS = {
     PERMISSIONS.VIEW_CUPS,
     PERMISSIONS.VIEW_RAW_MATERIALS,
     PERMISSIONS.VIEW_BIKES,
+    // Sprint 6.2 — read-only inventory/batch visibility
+    PERMISSIONS.VIEW_INVENTORY,
   ],
 }
