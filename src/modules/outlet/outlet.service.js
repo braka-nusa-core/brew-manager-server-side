@@ -206,6 +206,15 @@ export const updateOutlet = async (tenantId, outletId, data) => {
   if (data.phone    !== undefined) updateData.phone    = data.phone?.trim()   ?? null
   if (data.isActive !== undefined) updateData.isActive = data.isActive
 
+  // ── Payroll configuration (Phase 1 fields) ────────────────
+  // Validated in outlet.validation.js — copied through here as-is,
+  // matching the same "only if provided" pattern as the fields above.
+  if (data.payrollType           !== undefined) updateData.payrollType           = data.payrollType
+  if (data.commissionPercentage  !== undefined) updateData.commissionPercentage  = data.commissionPercentage
+  if (data.mealAllowancePerDay   !== undefined) updateData.mealAllowancePerDay   = data.mealAllowancePerDay
+  if (data.weeklyAttendanceBonus !== undefined) updateData.weeklyAttendanceBonus = data.weeklyAttendanceBonus
+  if (data.bonusRules            !== undefined) updateData.bonusRules            = data.bonusRules
+
   const outlet = await Outlet.findOneAndUpdate(
     { _id: outletOid, tenantId: tenantOid, deletedAt: null },
     { $set: updateData },
