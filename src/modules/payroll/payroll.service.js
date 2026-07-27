@@ -380,6 +380,24 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
 
   const employees = await Employee.find(employeeQuery).lean()
 
+  console.log("========== PAYROLL DEBUG ==========");
+console.log("Tenant :", tenantOid?.toString());
+console.log("Outlet :", outletOid.toString());
+console.log("Employee Query :", employeeQuery);
+console.log("Employees Found :", employees.length);
+
+employees.forEach(e => {
+    console.log({
+        id: e._id.toString(),
+        name: e.name,
+        outletId: e.outletId.toString(),
+        tenantId: e.tenantId?.toString(),
+        active: e.isActive
+    });
+});
+
+console.log("==================================");
+
   if (employees.length === 0) {
     return { generated: 0, updated: 0, skipped: 0, skippedItems: [] }
   }
