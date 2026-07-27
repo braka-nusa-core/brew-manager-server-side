@@ -381,18 +381,24 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
   const employees = await Employee.find(employeeQuery).lean()
 
   if (employees.length === 0) {
-    return { generated: 0, skipped: 0, skippedItems: [] }
+    return { generated: 0, updated: 0, skipped: 0, skippedItems: [] }
   }
 
   const skippedItems = []
-  const payrollDocs  = []
+  const payrollDocs  = []   // new documents → insertMany at the end
+  const updateOps    = []   // existing draft documents → recalculated in place
+  let updated = 0
 
   // ── Per-employee loop ─────────────────────────────────────────
 
   for (const employee of employees) {
     const employeeOid = employee._id
 
-    // ── Duplicate guard ───────────────────────────────────────
+    // ── P0.3.3: Generate → create / update / locked ───────────
+    // - Not found            → create (unchanged from before)
+    // - Found, status draft  → recalculate using current Attendance
+    //                          + Sales, update the existing document
+    // - Found, approved/paid → locked; do NOT touch, report message
     const existingQuery = {
       employeeId:     employeeOid,
       'period.month': numMonth,
@@ -401,11 +407,12 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
     if (tenantOid) existingQuery.tenantId = tenantOid
 
     const existing = await Payroll.findOne(existingQuery).lean()
-    if (existing) {
+
+    if (existing && existing.status !== 'draft') {
       skippedItems.push({
         employeeId:   employeeOid.toString(),
         employeeName: employee.name,
-        reason:       `Payroll already exists with status '${existing.status}'`,
+        reason:       'Payroll has already been locked.',
       })
       continue
     }
@@ -490,27 +497,30 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
     const { totalBonus: weeklyAttendanceBonus, weeklyBonusBreakdown } =
       calculateWeeklyAttendanceBonus(attendanceMap, numMonth, numYear, weeklyBonusAmount)
 
-    // ── Step 9: Build payroll document ────────────────────────
+    // ── Step 9: Build recalculated fields ──────────────────────
+    // P0.3.3: when updating an existing draft, preserve any manual
+    // adjustments (manualBonus/deductions/kasbon) the owner already
+    // made — only the recalculated (attendance/sales-derived) fields
+    // are refreshed. calculateTotalPay() is reused unchanged either way.
+    const manualBonus = existing ? (existing.manualBonus ?? 0) : 0
+    const deductions  = existing ? (existing.deductions  ?? 0) : 0
+    const kasbon      = existing ? (existing.kasbon      ?? 0) : 0
+
     const payrollFields = {
       salaryEarned,
       cupsBonus:             0,            // legacy field — explicitly 0 on Phase 4 records
       mealAllowanceTotal,
       dailyTierBonus,
       weeklyAttendanceBonus,
-      manualBonus:           0,
-      deductions:            0,
-      kasbon:                0,
+      manualBonus,
+      deductions,
+      kasbon,
     }
 
     const totalPay = calculateTotalPay(payrollFields)
 
-    payrollDocs.push({
-      tenantId:     tenantOid ?? undefined,
-      outletId:     outletOid,
-      employeeId:   employeeOid,
-      period:       { month: numMonth, year: numYear },
-
-      // ── Snapshot: employee state at generation time ──
+    const recalculatedFields = {
+      // ── Snapshot: employee state at (re)generation time ──
       salaryType:   employee.salaryType,
       baseSalary:   employee.baseSalary,  // preserved for reference; NOT used for commission type
       payrollType,                         // outlet config snapshot
@@ -525,23 +535,15 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
 
       // ── Calculated earnings ──
       commission,                          // 0 for fixed type
-      // P0.3.2.1: immutable snapshots of the inputs behind `commission`,
-      // reused from the values already computed above — no re-query,
-      // no recalculation. totalRevenue reflects actual sales regardless
-      // of payrollType; commissionPercentage is the outlet's configured
-      // rate and is only meaningful when payrollType is 'commission'.
+      // P0.3.2.1: snapshots of the inputs behind `commission`. Immutable
+      // once locked (approved/paid); refreshed on every draft recalculation
+      // per P0.3.3, since the payroll is still "running" until locked.
       totalRevenue,
       commissionPercentage,
       salaryEarned,
-      cupsBonus:             0,            // legacy field — 0 on Phase 4 records
       mealAllowanceTotal,
       dailyTierBonus,
       weeklyAttendanceBonus,
-
-      // ── Adjustable fields (defaults at generation) ──
-      manualBonus:  0,
-      deductions:   0,
-      kasbon:       0,
 
       // ── Calculated total ──
       totalPay,
@@ -549,14 +551,41 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
       // ── Audit trail arrays ──
       bonusBreakdown,         // per-day: { date, cupsSold, bonus }
       weeklyBonusBreakdown,   // per-week: { weekNumber, qualified, bonus }
+    }
 
-      // ── Status & audit ──
-      status:       'draft',
-      generatedBy:  new mongoose.Types.ObjectId(user.userId),
-      generatedAt:  new Date(),
-      approvedBy:   null,
-      approvedAt:   null,
-    })
+    if (existing) {
+      // ── Update path: recalculate existing draft in place ────
+      updateOps.push({
+        updateOne: {
+          filter: { _id: existing._id },
+          update: { $set: recalculatedFields },
+        },
+      })
+      updated++
+    } else {
+      // ── Create path: unchanged from before ───────────────────
+      payrollDocs.push({
+        tenantId:     tenantOid ?? undefined,
+        outletId:     outletOid,
+        employeeId:   employeeOid,
+        period:       { month: numMonth, year: numYear },
+
+        ...recalculatedFields,
+        cupsBonus:             0,            // legacy field — 0 on Phase 4 records
+
+        // ── Adjustable fields (defaults at generation) ──
+        manualBonus:  0,
+        deductions:   0,
+        kasbon:       0,
+
+        // ── Status & audit ──
+        status:       'draft',
+        generatedBy:  new mongoose.Types.ObjectId(user.userId),
+        generatedAt:  new Date(),
+        approvedBy:   null,
+        approvedAt:   null,
+      })
+    }
 
     // ── Notification Center addition ──────────────────────────
     // Fires strictly after payrollDocs.push() above — cannot affect
@@ -577,7 +606,7 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
     }
   }
 
-  // ── Step 10: Batch insert ─────────────────────────────────────
+  // ── Step 10: Batch insert + batch update ───────────────────────
   // ordered: false — one failure does not abort the rest
   let generated = 0
 
@@ -604,6 +633,13 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
     }
   }
 
+  // P0.3.3: recalculate existing draft payrolls in place. Each op is
+  // filtered on _id, so this can never touch an approved/paid record —
+  // those were already excluded earlier in the loop.
+  if (updateOps.length > 0) {
+    await Payroll.bulkWrite(updateOps, { ordered: false })
+  }
+
   // ── Notification Center addition ──────────────────────────────
   // Fires after the batch insert above is fully resolved (success
   // or partial failure) — uses the already-computed `generated`
@@ -622,6 +658,7 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
 
   return {
     generated,
+    updated,
     skipped:      skippedItems.length,
     skippedItems,
   }

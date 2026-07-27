@@ -34,9 +34,9 @@ export const generate = asyncHandler(async (req, res) => {
     data:     req.body,
   })
 
-  const message = result.generated === 0
-    ? 'No payroll records generated — all employees already have payroll for this period'
-    : `Payroll generated: ${result.generated} created, ${result.skipped} skipped`
+  const message = (result.generated === 0 && result.updated === 0)
+    ? 'No payroll records generated — all employees already have locked payroll for this period'
+    : `Payroll generated: ${result.generated} created, ${result.updated} updated, ${result.skipped} skipped`
 
   return res.status(201).json(successResponse(message, result))
 })
