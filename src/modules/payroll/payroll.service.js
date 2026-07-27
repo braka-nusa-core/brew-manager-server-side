@@ -664,13 +664,20 @@ export const getPayrolls = async ({ tenantId, user, queryParams }) => {
 }
 
 // ── getPayrollById ────────────────────────────────────────────
-// UNCHANGED from v1.0
+// Sprint 8.2.6a: populate employeeId(name) and outletId(name) so
+// PayrollDetailModal can render names without needing useEntityMap().
+// getPayrolls() (list) is intentionally NOT populated — PayrollTable
+// already resolves names via useEntityMap() and that architecture
+// is left untouched. No calculation fields are affected.
 
 export const getPayrollById = async ({ tenantId, user, payrollId }) => {
   const query = buildBaseQuery(tenantId, user)
   query._id = new mongoose.Types.ObjectId(payrollId)
 
-  const payroll = await Payroll.findOne(query).lean()
+  const payroll = await Payroll.findOne(query)
+    .populate('employeeId', 'name')
+    .populate('outletId', 'name')
+    .lean()
 
   if (!payroll) {
     throw new ApiError(404, 'Payroll record not found')
