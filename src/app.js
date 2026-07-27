@@ -42,6 +42,7 @@ import productRoutes    from './modules/product/product.routes.js'
 import productRecipeRoutes from './modules/productRecipe/productRecipe.routes.js'
 import cupRoutes        from './modules/cup/cup.routes.js'
 import inventoryRoutes  from './modules/inventory/inventory.routes.js'
+import productionRoutes from './modules/production/production.routes.js'
 import rawMaterialRoutes from './modules/rawMaterial/rawMaterial.routes.js'
 import riderPortalRoutes  from './modules/riderPortal/riderPortal.routes.js'
 import bikeRoutes         from './modules/bike/bike.routes.js'
@@ -122,6 +123,7 @@ app.use('/api/v1/products',   productRoutes)
 app.use('/api/v1/products/:productId/recipe', productRecipeRoutes)
 app.use('/api/v1/cups',       cupRoutes)
 app.use('/api/v1/inventory',  inventoryRoutes)
+app.use('/api/v1/production', productionRoutes)
 app.use('/api/v1/raw-materials', rawMaterialRoutes)
 
 // ── Public Routes (Phase 6A) ──────────────────────────────────

@@ -381,6 +381,36 @@ const withFreshness = (batch) => ({
 })
 
 /**
+ * Sprint 7.6 — API response enrichment (no business logic change).
+ *
+ * Attaches populated `product: {_id, name}` / `outlet: {_id, name}`
+ * objects to a plain document that already has raw `productId`/
+ * `outletId` fields — WITHOUT removing those raw fields, so existing
+ * consumers of productId/outletId keep working unchanged (backward
+ * compatible, purely additive).
+ *
+ * Written ONCE and reused by every endpoint that needs this (getBatchById,
+ * listBatchTransactions, getAdjustmentById) — per "avoid duplicate lookup
+ * logic." Reuses the existing Product/Outlet models directly; no new
+ * models, no schema changes.
+ *
+ * @param {Object} doc - plain object with productId/outletId fields
+ * @returns {Promise<Object>} doc with `product`/`outlet` added
+ */
+const enrichWithProductAndOutlet = async (doc) => {
+  const [product, outlet] = await Promise.all([
+    doc.productId ? Product.findById(doc.productId).select('name').lean() : null,
+    doc.outletId  ? Outlet.findById(doc.outletId).select('name').lean()   : null,
+  ])
+
+  return {
+    ...doc,
+    product: product ? { _id: product._id, name: product.name } : null,
+    outlet:  outlet  ? { _id: outlet._id,  name: outlet.name }   : null,
+  }
+}
+
+/**
  * Paginated list of InventoryBatch documents, each annotated with
  * ageInDays / freshness (computed, not stored) alongside the batch's own
  * quantityRemaining and status. Read-only — never mutates status.
@@ -448,7 +478,7 @@ export const getBatchById = async (tenantId, outletId, batchId) => {
     throw new ApiError(404, 'Inventory batch not found')
   }
 
-  return withFreshness(batch)
+  return enrichWithProductAndOutlet(withFreshness(batch))
 }
 
 // ============================================================
@@ -516,6 +546,18 @@ export const getInventoryDashboard = async (tenantId, outletId, queryParams = {}
     { $sort: { _id: 1 } },
   ])
 
+  // Sprint 6.4 — today / this-month adjustment activity, grouped by
+  // reason. Both use the same shared aggregation shape (extracted to
+  // groupAdjustmentsSince below) to avoid writing the same $group twice.
+  const now          = new Date()
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1)
+
+  const [todayAdjustmentByReason, monthAdjustmentByReason] = await Promise.all([
+    groupAdjustmentsSince(filter, startOfToday),
+    groupAdjustmentsSince(filter, startOfMonth),
+  ])
+
   return {
     totalBatches:        statusSummary?.totalBatches ?? 0,
     activeBatches:        statusSummary?.activeBatches ?? 0,
@@ -528,7 +570,41 @@ export const getInventoryDashboard = async (tenantId, outletId, queryParams = {}
         type: t._id, count: t.count, totalQuantity: t.totalQuantity,
       })),
     },
+    todayAdjustment: {
+      sinceDate: startOfToday,
+      byReason:  todayAdjustmentByReason,
+    },
+    monthAdjustment: {
+      sinceDate: startOfMonth,
+      byReason:  monthAdjustmentByReason,
+    },
   }
+}
+
+/**
+ * Shared aggregation shape for "adjustment transactions since date X,
+ * grouped by reason" — used for both todayAdjustment and monthAdjustment
+ * in getInventoryDashboard so the $group pipeline isn't written twice.
+ *
+ * @param {Object} tenantOutletFilter - already-built filter from buildTenantOutletFilter
+ * @param {Date} sinceDate
+ */
+const groupAdjustmentsSince = async (tenantOutletFilter, sinceDate) => {
+  const grouped = await InventoryTransaction.aggregate([
+    { $match: { ...tenantOutletFilter, type: 'adjustment', createdAt: { $gte: sinceDate } } },
+    {
+      $group: {
+        _id:                '$reason',
+        count:               { $sum: 1 },
+        totalQuantityDelta:  { $sum: '$quantityDelta' },
+      },
+    },
+    { $sort: { _id: 1 } },
+  ])
+
+  return grouped.map((g) => ({
+    reason: g._id, count: g.count, totalQuantityDelta: g.totalQuantityDelta,
+  }))
 }
 
 // ── getInventoryOverview ──────────────────────────────────────
@@ -699,7 +775,9 @@ export const getProductInventoryDetail = async (tenantId, outletId, productId, q
 /**
  * Paginated, filterable, sortable InventoryTransaction ledger across the
  * tenant (outlet-scoped per the same rule as everything else in this
- * module). Includes the product name via $lookup for readability.
+ * module). Includes populated `product`/`outlet` objects via $lookup —
+ * Sprint 7.6 enrichment, additive only (existing `productId`/`outletId`/
+ * `productName` fields are all still present, unchanged).
  *
  * Filters: type, productId, batchId, dateFrom, dateTo, search (notes
  * substring, case-insensitive).
@@ -715,7 +793,20 @@ export const listTransactions = async (tenantId, outletId, queryParams = {}) => 
 
   if (queryParams.type)      filter.type      = queryParams.type
   if (queryParams.productId) filter.productId = new mongoose.Types.ObjectId(queryParams.productId)
+  // Sprint 8.2 — optional multi-product filter (e.g. Production's
+  // product-name search resolves to a set of matching productIds).
+  // Additive: only applied if provided; takes precedence over the single
+  // productId above when both happen to be present. No existing caller
+  // (listAdjustments, the general /inventory/transactions route) sends
+  // this, so their behavior is unchanged.
+  if (queryParams.productIds && queryParams.productIds.length > 0) {
+    filter.productId = { $in: queryParams.productIds }
+  }
   if (queryParams.batchId)   filter.batchId   = new mongoose.Types.ObjectId(queryParams.batchId)
+  // Sprint 6.4 — only meaningful for type='adjustment', but harmless as a
+  // general filter (non-adjustment documents simply have reason: null and
+  // won't match a non-null reason filter).
+  if (queryParams.reason)    filter.reason    = queryParams.reason
 
   if (queryParams.dateFrom || queryParams.dateTo) {
     filter.createdAt = {}
@@ -742,11 +833,33 @@ export const listTransactions = async (tenantId, outletId, queryParams = {}) => 
       },
     },
     { $unwind: { path: '$product', preserveNullAndEmptyArrays: true } },
+    // Sprint 7.6 — reuses the existing Outlet model via the same $lookup
+    // pattern already established above for Product; no duplicate lookup
+    // implementation, just the same technique applied to a second collection.
+    {
+      $lookup: {
+        from:         Outlet.collection.name,
+        localField:   'outletId',
+        foreignField: '_id',
+        as:           'outlet',
+      },
+    },
+    { $unwind: { path: '$outlet', preserveNullAndEmptyArrays: true } },
     {
       $project: {
         tenantId: 1, outletId: 1, productId: 1, batchId: 1, type: 1,
         quantityDelta: 1, cupRecordId: 1, createdBy: 1, createdAt: 1, notes: 1,
+        reason: 1, beforeQuantity: 1, afterQuantity: 1,
+        // Kept for backward compatibility (Sprint 7.2 field) —
         productName: '$product.name',
+        // Sprint 7.6 — populated objects, null when not found (matches
+        // enrichWithProductAndOutlet's null-when-missing behavior).
+        product: {
+          $cond: [{ $ifNull: ['$product', false] }, { _id: '$product._id', name: '$product.name' }, null],
+        },
+        outlet: {
+          $cond: [{ $ifNull: ['$outlet', false] }, { _id: '$outlet._id', name: '$outlet.name' }, null],
+        },
       },
     },
     {
@@ -800,9 +913,515 @@ export const listBatchTransactions = async (tenantId, outletId, batchId, queryPa
     InventoryTransaction.countDocuments(filter),
   ])
 
+  // Sprint 7.6 — enrich ONCE using the batch's own productId/outletId
+  // (every transaction in this list is scoped to this single batch, so
+  // they all share the same product/outlet — attaching the same already-
+  // fetched {product, outlet} to each avoids N duplicate lookups for one
+  // response).
+  const enrichedBatch = await enrichWithProductAndOutlet(withFreshness(batch))
+  const enrichedTransactions = transactions.map((txn) => ({
+    ...txn,
+    product: enrichedBatch.product,
+    outlet:  enrichedBatch.outlet,
+  }))
+
   return {
-    batch: withFreshness(batch),
-    transactions,
+    batch: enrichedBatch,
+    transactions: enrichedTransactions,
     pagination: buildPaginationMeta({ total, page, limit }),
+  }
+}
+
+// ============================================================
+// Sprint 6.4 — Inventory Adjustment & Stock Opname.
+//
+// InventoryBatch remains lifecycle-only: nothing below ever edits
+// quantityRemaining/status directly outside of the same $set-from-
+// InventoryTransaction pattern already used by consumeFifo/
+// applyReturnAndReject. There is still no PATCH/PUT on InventoryBatch —
+// every mutation is the side-effect of writing an InventoryTransaction
+// first, inside the same session transaction.
+// ============================================================
+
+// ── applyAdjustmentToBatch (shared core — used by BOTH manual
+//    adjustment and stock opname, so the write logic exists in exactly
+//    one place) ──────────────────────────────────────────────
+
+/**
+ * Applies one signed quantity adjustment to ONE batch: writes the
+ * InventoryTransaction(type='adjustment') first, then updates
+ * InventoryBatch.quantityRemaining/status as a direct consequence of
+ * that transaction — same pattern as every other movement type in this
+ * module. MUST be called from inside an active session transaction.
+ *
+ * Throws ApiError(400) if the adjustment would drive quantityRemaining
+ * negative (a batch can never hold negative stock).
+ *
+ * @param {import('mongoose').ClientSession} session
+ * @param {Object} params
+ * @param {string} params.tenantId
+ * @param {string} params.outletId
+ * @param {string} params.productId
+ * @param {string} params.batchId
+ * @param {number} params.quantityDelta - signed, non-zero
+ * @param {string} params.reason
+ * @param {string} [params.notes]
+ * @param {string} params.userId
+ * @returns {Promise<Object>} the created InventoryTransaction (plain object)
+ */
+const applyAdjustmentToBatch = async (session, {
+  tenantId, outletId, productId, batchId, quantityDelta, reason, notes, userId,
+}) => {
+  const batch = await InventoryBatch.findOne({
+    _id: batchId, tenantId: new mongoose.Types.ObjectId(tenantId),
+  }).session(session)
+
+  if (!batch) {
+    throw new ApiError(404, `Inventory batch ${batchId} not found`)
+  }
+
+  const beforeQuantity = batch.quantityRemaining
+  const afterQuantity  = beforeQuantity + quantityDelta
+
+  if (afterQuantity < 0) {
+    throw new ApiError(
+      400,
+      `Adjustment would result in a negative remaining quantity for batch ${batchId} ` +
+      `(before: ${beforeQuantity}, delta: ${quantityDelta}).`
+    )
+  }
+
+  // InventoryBatch stays lifecycle-only: status is simply re-derived from
+  // the new quantity (active if >0, depleted if 0) — never touched by
+  // anything expiry-related, exactly like every other movement type.
+  await InventoryBatch.updateOne(
+    { _id: batch._id },
+    [
+      { $set: { quantityRemaining: { $add: ['$quantityRemaining', quantityDelta] } } },
+      { $set: { status: { $cond: [{ $lte: ['$quantityRemaining', 0] }, 'depleted', 'active'] } } },
+    ],
+    { session }
+  )
+
+  const created = await InventoryTransaction.create([{
+    tenantId:      new mongoose.Types.ObjectId(tenantId),
+    outletId:      new mongoose.Types.ObjectId(outletId),
+    productId:     new mongoose.Types.ObjectId(productId),
+    batchId:       batch._id,
+    type:          'adjustment',
+    quantityDelta,
+    cupRecordId:   null,
+    createdBy:     new mongoose.Types.ObjectId(userId),
+    reason,
+    beforeQuantity,
+    afterQuantity,
+    notes: notes?.trim() || null,
+  }], { session })
+
+  return created[0].toObject()
+}
+
+// ── createAdjustment ──────────────────────────────────────────
+// POST /inventory/adjustment
+
+/**
+ * Manual, single-batch adjustment (e.g. damage, loss, count correction).
+ * Runs inside a session transaction — the InventoryTransaction write and
+ * the InventoryBatch quantity/status update commit or abort together.
+ *
+ * @param {string} tenantId
+ * @param {string|null} outletId - req.outletId, enforced as the batch's
+ *   required scope when present (manager/cashier), unrestricted when null
+ *   (super_admin/tenant_admin may adjust any outlet's batch).
+ * @param {Object} data - { batchId, quantityDelta, reason, notes? }
+ * @param {string} userId
+ */
+export const createAdjustment = async (tenantId, outletId, data, userId) => {
+  const session = await mongoose.startSession()
+  let result
+
+  try {
+    await session.withTransaction(async () => {
+      const batchOid = new mongoose.Types.ObjectId(data.batchId)
+      const scopeFilter = { _id: batchOid, tenantId: new mongoose.Types.ObjectId(tenantId) }
+      if (outletId) scopeFilter.outletId = new mongoose.Types.ObjectId(outletId)
+
+      const batch = await InventoryBatch.findOne(scopeFilter).session(session).lean()
+      if (!batch) {
+        throw new ApiError(404, 'Inventory batch not found')
+      }
+
+      result = await applyAdjustmentToBatch(session, {
+        tenantId, outletId: batch.outletId, productId: batch.productId, batchId: batch._id,
+        quantityDelta: data.quantityDelta, reason: data.reason, notes: data.notes, userId,
+      })
+    })
+  } finally {
+    await session.endSession()
+  }
+
+  return result
+}
+
+// ── performStockOpname ────────────────────────────────────────
+// POST /inventory/opname
+
+/**
+ * Compares a physically counted quantity against the current system
+ * total (sum of quantityRemaining across ALL of this product's batches
+ * at the outlet — active or depleted, since a physical recount corrects
+ * reality regardless of a batch's lifecycle state) and automatically
+ * creates the adjustment transaction(s) needed to reconcile the
+ * difference, reason='stock_opname' (reserved — never settable via
+ * createAdjustment directly).
+ *
+ * Attribution rule (a physical count can't say which exact batch changed,
+ * so a reasonable default is applied):
+ *   - Shortage (physicalQty < systemQty): debited oldest-batch-first
+ *     (mirrors FIFO physical handling — oldest stock is assumed consumed/
+ *     lost first), possibly spanning multiple batches → multiple
+ *     transactions.
+ *   - Surplus (physicalQty > systemQty): credited entirely to the most
+ *     recently produced batch. Requires at least one existing batch for
+ *     this product/outlet — a surplus with zero batches on record cannot
+ *     be attributed to any producedAt and is rejected (record a
+ *     production batch first).
+ *
+ * Runs inside ONE session transaction — all resulting adjustment
+ * transactions commit or abort together.
+ *
+ * @param {string} tenantId
+ * @param {string|null} outletId - req.outletId; MUST be present (opname is
+ *   always outlet-scoped — there is no cross-outlet physical count).
+ * @param {Object} data - { productId, physicalQty, notes? }
+ * @param {string} userId
+ */
+export const performStockOpname = async (tenantId, outletId, data, userId) => {
+  if (!outletId) {
+    throw new ApiError(
+      400,
+      'Outlet context is required to perform a stock opname. Sign in with an outlet-scoped account (manager/cashier) or select an outlet.'
+    )
+  }
+
+  const tenantOid  = new mongoose.Types.ObjectId(tenantId)
+  const outletOid  = new mongoose.Types.ObjectId(outletId)
+  const productOid = new mongoose.Types.ObjectId(data.productId)
+
+  const session = await mongoose.startSession()
+  let result
+
+  try {
+    await session.withTransaction(async () => {
+      const product = await Product.findOne({ _id: productOid, tenantId: tenantOid }).session(session).lean()
+      if (!product) {
+        throw new ApiError(400, 'Invalid product.')
+      }
+
+      const batches = await InventoryBatch
+        .find({ tenantId: tenantOid, outletId: outletOid, productId: productOid })
+        .sort({ producedAt: 1, _id: 1 })
+        .session(session)
+
+      const systemQty = batches.reduce((sum, b) => sum + b.quantityRemaining, 0)
+      const delta      = data.physicalQty - systemQty
+
+      if (delta === 0) {
+        result = { systemQty, physicalQty: data.physicalQty, delta: 0, transactions: [] }
+        return
+      }
+
+      const transactions = []
+
+      if (delta > 0) {
+        if (batches.length === 0) {
+          throw new ApiError(
+            400,
+            'Cannot record a stock opname surplus — no existing batch for this product at this outlet. Record production first.'
+          )
+        }
+        const newestBatch = batches[batches.length - 1]
+        const txn = await applyAdjustmentToBatch(session, {
+          tenantId, outletId: outletOid, productId: productOid, batchId: newestBatch._id,
+          quantityDelta: delta, reason: 'stock_opname', notes: data.notes, userId,
+        })
+        transactions.push(txn)
+      } else {
+        let remainingToRemove = -delta // positive magnitude
+        for (const batch of batches) {
+          if (remainingToRemove <= 0) break
+          const take = Math.min(remainingToRemove, batch.quantityRemaining)
+          if (take <= 0) continue
+
+          const txn = await applyAdjustmentToBatch(session, {
+            tenantId, outletId: outletOid, productId: productOid, batchId: batch._id,
+            quantityDelta: -take, reason: 'stock_opname', notes: data.notes, userId,
+          })
+          transactions.push(txn)
+          remainingToRemove -= take
+        }
+        // remainingToRemove cannot exceed 0 here by construction: |delta|
+        // is bounded by systemQty (physicalQty >= 0), which is exactly the
+        // sum of every batch's quantityRemaining walked above.
+      }
+
+      result = { systemQty, physicalQty: data.physicalQty, delta, transactions }
+    })
+  } finally {
+    await session.endSession()
+  }
+
+  return result
+}
+
+// ── listAdjustments ───────────────────────────────────────────
+// GET /inventory/adjustments
+//
+// Thin wrapper over listTransactions — reuses its filtering, search,
+// sorting, pagination, and product-name $lookup entirely; only forces
+// type='adjustment' (query-supplied `type` is ignored/overridden, since
+// this endpoint is adjustment-only by definition). No logic duplicated.
+
+export const listAdjustments = (tenantId, outletId, queryParams = {}) =>
+  listTransactions(tenantId, outletId, { ...queryParams, type: 'adjustment' })
+
+// ── getTransactionById ────────────────────────────────────────
+// Generic single-transaction lookup, outlet-scoped like everything else
+// in this module. Used directly by GET /inventory/adjustments/:id
+// (via getAdjustmentById below) and available for reuse by any future
+// single-transaction endpoint without duplicating this query.
+// Sprint 7.6 — enriched with product/outlet via enrichWithProductAndOutlet.
+
+export const getTransactionById = async (tenantId, outletId, transactionId) => {
+  const filter = {
+    _id:      new mongoose.Types.ObjectId(transactionId),
+    tenantId: new mongoose.Types.ObjectId(tenantId),
+  }
+  if (outletId) filter.outletId = new mongoose.Types.ObjectId(outletId)
+
+  const txn = await InventoryTransaction.findOne(filter).lean()
+  if (!txn) {
+    throw new ApiError(404, 'Inventory transaction not found')
+  }
+
+  return enrichWithProductAndOutlet(txn)
+}
+
+// ── getAdjustmentById ─────────────────────────────────────────
+// GET /inventory/adjustments/:id
+//
+// Reuses getTransactionById — only adds the type='adjustment' scoping
+// check on top (404 if the id exists but isn't an adjustment), so this
+// endpoint stays semantically scoped without a second query implementation.
+
+export const getAdjustmentById = async (tenantId, outletId, transactionId) => {
+  const txn = await getTransactionById(tenantId, outletId, transactionId)
+
+  if (txn.type !== 'adjustment') {
+    throw new ApiError(404, 'Inventory transaction not found')
+  }
+
+  return txn
+}
+
+// ============================================================
+// Sprint 8.1 — Production Module.
+//
+// The write path (createProductionBatch — InventoryBatch.create +
+// InventoryTransaction(type='production'), one session, one new batch
+// per call, never reuses a previous batch) already exists unchanged from
+// Sprint 6.2. The two functions below are READ-ONLY thin wrappers over
+// the SAME listTransactions/getTransactionById/getBatchById already used
+// by adjustments — mirroring listAdjustments/getAdjustmentById exactly.
+// No new inventory logic, no new lookup implementation, no schema change.
+// ============================================================
+
+// ── listProduction ────────────────────────────────────────────
+// GET /production
+//
+// Thin wrapper over listTransactions — reuses its filtering (productId,
+// dateFrom/dateTo, sort, order), pagination, and product/outlet $lookup
+// entirely; only forces type='production'. No logic duplicated.
+//
+// Sprint 8.2 additions (still calling the same listTransactions
+// underneath, no parallel pipeline):
+//   - `period` quick-filter ('today'|'thisWeek'|'thisMonth') resolved
+//     into dateFrom/dateTo here — dateFrom/dateTo passed directly still
+//     work unchanged for a custom range (period simply takes precedence
+//     if both are somehow given).
+//   - `search` here means "Product Name OR Batch ID" (not notes, unlike
+//     the generic /inventory/transactions & /inventory/adjustments
+//     search) — a 24-char hex string is treated as an exact batchId
+//     match; anything else resolves to matching productIds via the
+//     existing Product model, then passed as listTransactions' new
+//     (Sprint 8.2, additive) `productIds` filter. This does NOT change
+//     listAdjustments' own search behavior (notes) — resolved entirely
+//     here, before delegating.
+
+const resolvePeriodFilter = (queryParams) => {
+  if (!queryParams.period) return queryParams
+
+  const now = new Date()
+  let dateFrom
+
+  if (queryParams.period === 'today') {
+    dateFrom = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  } else if (queryParams.period === 'thisWeek') {
+    const day = now.getDay() // 0 = Sunday
+    const diffToMonday = day === 0 ? 6 : day - 1
+    dateFrom = new Date(now.getFullYear(), now.getMonth(), now.getDate() - diffToMonday)
+  } else if (queryParams.period === 'thisMonth') {
+    dateFrom = new Date(now.getFullYear(), now.getMonth(), 1)
+  } else {
+    return queryParams // unknown value — ignore, fall back to any explicit dateFrom/dateTo
+  }
+
+  return { ...queryParams, dateFrom: dateFrom.toISOString() }
+}
+
+export const listProduction = async (tenantId, outletId, queryParams = {}) => {
+  const resolved = resolvePeriodFilter(queryParams)
+  const params = { ...resolved, type: 'production' }
+  delete params.search
+  delete params.period
+
+  if (resolved.search) {
+    const term = resolved.search.trim()
+    const looksLikeObjectId = mongoose.Types.ObjectId.isValid(term) && term.length === 24
+
+    if (looksLikeObjectId) {
+      params.batchId = term
+    } else if (term) {
+      const matchingProducts = await Product.find({
+        tenantId: new mongoose.Types.ObjectId(tenantId),
+        name: { $regex: term, $options: 'i' },
+      }).select('_id').lean()
+      params.productIds = matchingProducts.map((p) => p._id)
+    }
+  }
+
+  return listTransactions(tenantId, outletId, params)
+}
+
+// ── getProductionById ─────────────────────────────────────────
+// GET /production/:id
+//
+// Reuses getTransactionById (the production transaction itself — already
+// enriched with product/outlet) AND getBatchById (the batch it created —
+// already enriched with product/outlet, ageInDays, freshness). One
+// production = one batch = one transaction, so this is a simple 1:1 join
+// of two already-existing single-document lookups — no new query logic.
+
+export const getProductionById = async (tenantId, outletId, transactionId) => {
+  const transaction = await getTransactionById(tenantId, outletId, transactionId)
+
+  if (transaction.type !== 'production') {
+    throw new ApiError(404, 'Production record not found')
+  }
+
+  const batch = await getBatchById(tenantId, outletId, transaction.batchId)
+
+  return { transaction, batch }
+}
+
+// ── getProductionDashboard ────────────────────────────────────
+// GET /production/dashboard
+//
+// Sprint 8.2. Reuses the exact aggregation style already established in
+// getInventoryDashboard (Sprint 6.4/7.1): buildTenantOutletFilter for
+// scope, simple $group aggregations for totals, Product $lookup for
+// per-product breakdown (same technique as getInventoryOverview), and
+// enrichWithProductAndOutlet for the recent-activity list (same as every
+// other single/small-list read in this module). No new aggregation
+// technique introduced.
+
+export const getProductionDashboard = async (tenantId, outletId, queryParams = {}) => {
+  const filter = buildTenantOutletFilter(tenantId, outletId, queryParams.outletId)
+  const productionFilter = { ...filter, type: 'production' }
+
+  const now          = new Date()
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1)
+
+  const [[todayAgg], [monthAgg]] = await Promise.all([
+    InventoryTransaction.aggregate([
+      { $match: { ...productionFilter, createdAt: { $gte: startOfToday } } },
+      { $group: { _id: null, count: { $sum: 1 }, totalQuantity: { $sum: '$quantityDelta' } } },
+    ]),
+    InventoryTransaction.aggregate([
+      { $match: { ...productionFilter, createdAt: { $gte: startOfMonth } } },
+      { $group: { _id: null, count: { $sum: 1 }, totalQuantity: { $sum: '$quantityDelta' } } },
+    ]),
+  ])
+
+  // productionByProduct — this month, grouped by product (same $lookup
+  // technique as getInventoryOverview's per-product rollup).
+  const productionByProduct = await InventoryTransaction.aggregate([
+    { $match: { ...productionFilter, createdAt: { $gte: startOfMonth } } },
+    { $group: { _id: '$productId', count: { $sum: 1 }, totalQuantity: { $sum: '$quantityDelta' } } },
+    {
+      $lookup: {
+        from:         Product.collection.name,
+        localField:   '_id',
+        foreignField: '_id',
+        as:           'product',
+      },
+    },
+    { $unwind: { path: '$product', preserveNullAndEmptyArrays: true } },
+    {
+      $project: {
+        _id: 0, productId: '$_id', productName: '$product.name', count: 1, totalQuantity: 1,
+      },
+    },
+    { $sort: { totalQuantity: -1 } },
+  ])
+
+  // Last 7 days daily breakdown (for a simple bar/line chart) — same
+  // $match scope, grouped by calendar day.
+  const sevenDaysAgo = new Date(startOfToday)
+  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6) // 7 days inclusive of today
+
+  const last7DaysRaw = await InventoryTransaction.aggregate([
+    { $match: { ...productionFilter, createdAt: { $gte: sevenDaysAgo } } },
+    {
+      $group: {
+        _id:           { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+        count:         { $sum: 1 },
+        totalQuantity: { $sum: '$quantityDelta' },
+      },
+    },
+    { $sort: { _id: 1 } },
+  ])
+
+  // Fill in zero-days so the chart always has exactly 7 points, oldest first.
+  const last7DaysMap = new Map(last7DaysRaw.map((d) => [d._id, d]))
+  const last7Days = []
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(sevenDaysAgo)
+    d.setDate(d.getDate() + i)
+    const key = d.toISOString().split('T')[0]
+    const found = last7DaysMap.get(key)
+    last7Days.push({ date: key, count: found?.count ?? 0, totalQuantity: found?.totalQuantity ?? 0 })
+  }
+
+  // Recent production — last 10, enriched with product/outlet (reuses
+  // enrichWithProductAndOutlet, same helper used by getBatchById/
+  // getTransactionById — no duplicate lookup implementation).
+  const recentRaw = await InventoryTransaction
+    .find(productionFilter)
+    .sort({ createdAt: -1 })
+    .limit(10)
+    .lean()
+
+  const recentProduction = await Promise.all(recentRaw.map((txn) => enrichWithProductAndOutlet(txn)))
+
+  return {
+    todayProduction: todayAgg?.count ?? 0,
+    monthProduction: monthAgg?.count ?? 0,
+    todayQuantity:   todayAgg?.totalQuantity ?? 0,
+    monthQuantity:   monthAgg?.totalQuantity ?? 0,
+    productionByProduct,
+    last7Days,
+    recentProduction,
   }
 }
