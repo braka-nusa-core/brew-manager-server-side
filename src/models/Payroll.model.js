@@ -149,6 +149,25 @@ const payrollSchema = new Schema(
       min:     [0, 'Commission cannot be negative'],
     },
 
+    // ── Commission Snapshot (P0.3.2.1 addition) ───────────────
+    // Snapshot of the raw inputs used to compute `commission` above.
+    // Persisted at generation time from values already calculated in
+    // generatePayroll() — never recalculated or re-queried afterwards.
+    // Immutable: adjustPayroll() must never write to these fields.
+    // For fixed-type payrolls these remain 0 (no revenue/rate applies).
+
+    totalRevenue: {
+      type:    Number,
+      default: 0,
+      min:     [0, 'Total revenue cannot be negative'],
+    },
+
+    commissionPercentage: {
+      type:    Number,
+      default: 0,
+      min:     [0, 'Commission percentage cannot be negative'],
+    },
+
     // ── Meal Allowance Total (Phase 1 addition) ───────────────
     // Calculated: Outlet.mealAllowancePerDay × presentDays
     // Applies to both fixed and commission payroll types.

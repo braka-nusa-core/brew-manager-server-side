@@ -525,6 +525,13 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
 
       // ── Calculated earnings ──
       commission,                          // 0 for fixed type
+      // P0.3.2.1: immutable snapshots of the inputs behind `commission`,
+      // reused from the values already computed above — no re-query,
+      // no recalculation. totalRevenue reflects actual sales regardless
+      // of payrollType; commissionPercentage is the outlet's configured
+      // rate and is only meaningful when payrollType is 'commission'.
+      totalRevenue,
+      commissionPercentage,
       salaryEarned,
       cupsBonus:             0,            // legacy field — 0 on Phase 4 records
       mealAllowanceTotal,
