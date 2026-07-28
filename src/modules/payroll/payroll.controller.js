@@ -19,6 +19,26 @@ import {
   adjustPayroll,
   markPayrollPaid,
 } from './payroll.service.js'
+import { previewPayroll } from './payrollPreviewService.js'
+
+// ── POST /api/v1/payroll/preview ─────────────────────────────
+// Read-only. Same validation shape and permission as /generate.
+// Never persists — safe to call repeatedly.
+
+export const preview = asyncHandler(async (req, res) => {
+  const { isValid, errors } = validateGeneratePayroll(req.body)
+  if (!isValid) {
+    return res.status(400).json(errorResponse('Validation failed', 400, errors))
+  }
+
+  const result = await previewPayroll({
+    tenantId: req.tenantId,
+    user:     req.user,
+    data:     req.body,
+  })
+
+  return res.status(200).json(successResponse('Payroll preview generated', result))
+})
 
 // ── POST /api/v1/payroll/generate ────────────────────────────
 

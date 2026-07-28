@@ -32,12 +32,23 @@ import {
   approve,
   reject,
   markPaid,
+  preview,
 } from './payroll.controller.js'
 
 const router = Router()
 
 router.use(authenticate)
 router.use(tenantGuard)
+
+// ── POST /api/v1/payroll/preview ─────────────────────────────
+// MUST be declared before /:payrollId. Read-only — same
+// permission as /generate since it exposes calculated
+// compensation figures before they're official.
+router.post(
+  '/preview',
+  authorize(PERMISSIONS.MANAGE_PAYROLL),
+  preview
+)
 
 // ── POST /api/v1/payroll/generate ────────────────────────────
 // MUST be declared before /:payrollId
