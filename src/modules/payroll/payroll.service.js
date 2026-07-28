@@ -380,24 +380,6 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
 
   const employees = await Employee.find(employeeQuery).lean()
 
-  console.log("========== PAYROLL DEBUG ==========");
-console.log("Tenant :", tenantOid?.toString());
-console.log("Outlet :", outletOid.toString());
-console.log("Employee Query :", employeeQuery);
-console.log("Employees Found :", employees.length);
-
-employees.forEach(e => {
-    console.log({
-        id: e._id.toString(),
-        name: e.name,
-        outletId: e.outletId.toString(),
-        tenantId: e.tenantId?.toString(),
-        active: e.isActive
-    });
-});
-
-console.log("==================================");
-
   if (employees.length === 0) {
     return { generated: 0, updated: 0, skipped: 0, skippedItems: [] }
   }
@@ -503,6 +485,8 @@ console.log("==================================");
       )
     }
 
+    console.log(`[TRACE 1] employeeId=${employeeOid} payrollType=${payrollType} salaryEarned=${salaryEarned} commission=${commission}`)
+
     // ── Step 6: Meal allowance (both types, raw presentDays) ──
     const mealAllowanceTotal = Math.floor(mealAllowancePerDay * presentDays)
 
@@ -510,10 +494,14 @@ console.log("==================================");
     const { totalBonus: dailyTierBonus, bonusBreakdown } =
       calculateDailyTierBonus(salesMap, bonusRules, periodDays)
 
+    console.log(`[TRACE 2] employeeId=${employeeOid} dailyTierBonus=${dailyTierBonus} bonusBreakdown.length=${bonusBreakdown?.length ?? 0}`)
+
     // ── Step 8: Weekly attendance bonus (both types) ──────────
     const attendanceMap = buildAttendanceMap(attendanceRecords)
     const { totalBonus: weeklyAttendanceBonus, weeklyBonusBreakdown } =
       calculateWeeklyAttendanceBonus(attendanceMap, numMonth, numYear, weeklyBonusAmount)
+
+    console.log(`[TRACE 3] employeeId=${employeeOid} weeklyAttendanceBonus=${weeklyAttendanceBonus} weeklyBonusBreakdown.length=${weeklyBonusBreakdown?.length ?? 0}`)
 
     // ── Step 9: Build recalculated fields ──────────────────────
     // P0.3.3: when updating an existing draft, preserve any manual
@@ -536,6 +524,8 @@ console.log("==================================");
     }
 
     const totalPay = calculateTotalPay(payrollFields)
+
+    console.log(`[TRACE 4] employeeId=${employeeOid} totalPay=${totalPay} payrollFields=${JSON.stringify(payrollFields)}`)
 
     const recalculatedFields = {
       // ── Snapshot: employee state at (re)generation time ──
@@ -582,6 +572,8 @@ console.log("==================================");
       updated++
     } else {
       // ── Create path: unchanged from before ───────────────────
+      console.log(`[TRACE 5] employeeId=${employeeOid} — about to push into payrollDocs. payrollDocs.length (before)=${payrollDocs.length}`)
+
       payrollDocs.push({
         tenantId:     tenantOid ?? undefined,
         outletId:     outletOid,
@@ -603,6 +595,8 @@ console.log("==================================");
         approvedBy:   null,
         approvedAt:   null,
       })
+
+      console.log(`[TRACE 6] employeeId=${employeeOid} — pushed into payrollDocs. payrollDocs.length (after)=${payrollDocs.length}`)
     }
 
     // ── Notification Center addition ──────────────────────────
@@ -628,11 +622,48 @@ console.log("==================================");
   // ordered: false — one failure does not abort the rest
   let generated = 0
 
+  console.log(`[TRACE 7] before insertMany() — payrollDocs.length=${payrollDocs.length}`)
+
+  // ── DIAGNOSTIC ONLY — verify collection/connection identity ────
+  console.log('[DIAG] Payroll.collection.name:', Payroll.collection.name)
+  console.log('[DIAG] Payroll.db.name:', Payroll.db?.name)
+  console.log('[DIAG] mongoose.connection.readyState:', mongoose.connection.readyState) // 1 = connected
+  console.log('[DIAG] mongoose.connection.name (db):', mongoose.connection.name)
+  console.log('[DIAG] mongoose.connection.host:', mongoose.connection.host)
+  try {
+    const collections = await mongoose.connection.db.listCollections().toArray()
+    console.log('[DIAG] collections visible in this db:', collections.map(c => c.name))
+  } catch (diagErr) {
+    console.log('[DIAG] listCollections() failed:', diagErr.message)
+  }
+
   if (payrollDocs.length > 0) {
     try {
       const result = await Payroll.insertMany(payrollDocs, { ordered: false })
+
+      // ── DIAGNOSTIC ONLY — no logic change ────────────────────
+      console.log('[DIAG] raw insertMany() result:', result)
+      console.log('[DIAG] Array.isArray(result):', Array.isArray(result))
+      console.log('[DIAG] result.constructor.name:', result?.constructor?.name)
+      if (Array.isArray(result)) {
+        console.log('[DIAG] result.map(x => x._id):', result.map(x => x._id))
+      }
+
       generated = result.length
+      console.log(`[TRACE 8] after insertMany() — result.length=${result.length} generated=${generated}`)
+
+      // ── DIAGNOSTIC ONLY — re-query Mongo directly to check whether
+      // documents actually landed in the collection regardless of
+      // what insertMany's return value claims ──────────────────
+      const inserted = await Payroll.find({
+        outletId:       outletOid,
+        'period.month': numMonth,
+        'period.year':  numYear,
+      }).lean()
+      console.log(`[DIAG] post-insertMany re-query — inserted.length=${inserted.length}`)
+      console.log('[DIAG] post-insertMany re-query — inserted docs:', inserted.map(d => ({ _id: d._id, employeeId: d.employeeId, status: d.status })))
     } catch (err) {
+      console.log(`[TRACE 9] insertMany() threw — err.name=${err.name} err.code=${err.code} err.message=${err.message}`)
       if (err.code === 11000 || err.name === 'BulkWriteError') {
         generated = err.result?.nInserted ?? 0
         const writeErrors = err.writeErrors ?? []

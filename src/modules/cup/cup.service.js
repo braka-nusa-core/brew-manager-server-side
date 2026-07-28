@@ -25,6 +25,7 @@ import {
   applyReturnAndReject,
   flattenSourceBatches,
 } from '../inventory/inventory.service.js'
+import { ensurePresentAttendance } from '../attendance/attendance.service.js'
 
 // ── Helpers ───────────────────────────────────────────────────
 
@@ -300,6 +301,29 @@ export const createCupRecord = async (tenantId, outletId, data, userId) => {
       }], { session })
 
       const record = created[0]
+
+      // ── Auto-mark rider PRESENT for this date ──
+      // The moment the first Cup Record for a rider on a day is
+      // created, that rider is considered present. Runs only after
+      // CupRecord.create() has succeeded above — and still inside the
+      // same transaction, so if this write itself fails, everything
+      // above (rider validation, FIFO consumption, the CupRecord
+      // document) rolls back too (all-or-nothing, same guarantee used
+      // throughout this function). Idempotent upsert: if attendance
+      // already exists for this rider/date (any status, e.g. a second
+      // Cup Record created same day, or a manual entry), it is left
+      // untouched — never overwritten, never duplicated. Entirely
+      // transparent to the API response — nothing below reads or
+      // returns this write's result. Does not touch Sale generation or
+      // the finalize flow — both are unchanged and still happen
+      // exclusively in finalizeCupRecord.
+      await ensurePresentAttendance(session, {
+        tenantId:   tenantOid,
+        outletId:   recordOutletId,
+        employeeId: rider._id,
+        date,
+        recordedBy: userId,
+      })
 
       result = {
         ...record.toObject(),

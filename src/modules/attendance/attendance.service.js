@@ -32,6 +32,7 @@ const normalizeDate = (value) => {
   d.setUTCHours(0, 0, 0, 0)
   return d
 }
+export { normalizeDate }
 
 /**
  * Builds the base MongoDB query with tenant and outlet scope.
@@ -156,7 +157,71 @@ export const createAttendance = async ({ tenantId, user, data }) => {
   return attendance
 }
 
-// ── bulkCreateAttendance ──────────────────────────────────────
+// ── ensurePresentAttendance ────────────────────────────────────
+
+/**
+ * Auto-marks a rider PRESENT for a given date as a side effect of
+ * Cup Record creation (the moment a manager/cashier creates the first
+ * Cup Record for a rider on a day, that rider is considered present).
+ * NOT an HTTP-facing operation — no `user`/role gating (this is a
+ * system-triggered action, not a manual attendance entry), and MUST be
+ * called from inside the caller's own mongoose session/transaction so
+ * that:
+ *   - if Cup Record creation fails anywhere (rider validation, FIFO
+ *     consumption, duplicate check, document creation), this write is
+ *     rolled back along with everything else — Attendance is never
+ *     created for a failed Cup Record creation.
+ *   - if this write itself fails, the whole creation transaction aborts
+ *     too (consistent with the all-or-nothing pattern already used
+ *     throughout cup.service.js).
+ *
+ * Idempotent by construction:
+ *   - Uses findOneAndUpdate + upsert with $setOnInsert only, so if an
+ *     Attendance record already exists for {tenantId, employeeId, date}
+ *     (whatever its status — manually entered, from a prior Cup Record
+ *     that day, holiday/leave, etc.), NOTHING is modified — no
+ *     overwrite, no duplicate, and no error.
+ *   - Backed by the model's existing unique index on
+ *     { tenantId, employeeId, date }, which is the actual hard guarantee
+ *     against duplicates at the DB level (not just an app-level check).
+ *
+ * @param {import('mongoose').ClientSession} session
+ * @param {Object} params
+ * @param {string|import('mongoose').Types.ObjectId} params.tenantId
+ * @param {string|import('mongoose').Types.ObjectId} params.outletId
+ * @param {string|import('mongoose').Types.ObjectId} params.employeeId - the rider (CupRecord.riderId)
+ * @param {Date|string} params.date - MUST be the CupRecord's own date
+ * @param {string|import('mongoose').Types.ObjectId} params.recordedBy - who created the CupRecord
+ */
+export const ensurePresentAttendance = async (
+  session,
+  { tenantId, outletId, employeeId, date, recordedBy }
+) => {
+  const tenantOid   = new mongoose.Types.ObjectId(tenantId)
+  const outletOid   = new mongoose.Types.ObjectId(outletId)
+  const employeeOid = new mongoose.Types.ObjectId(employeeId)
+  const normalizedDate = normalizeDate(date)
+
+  await Attendance.findOneAndUpdate(
+    {
+      tenantId:   tenantOid,
+      employeeId: employeeOid,
+      date:       normalizedDate,
+    },
+    {
+      $setOnInsert: {
+        tenantId:   tenantOid,
+        outletId:   outletOid,
+        employeeId: employeeOid,
+        date:       normalizedDate,
+        status:     'present',
+        notes:      'Auto-generated from CupRecord creation',
+        recordedBy: new mongoose.Types.ObjectId(recordedBy),
+      },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true, session }
+  )
+}
 
 /**
  * Creates attendance records for multiple employees on one date.
