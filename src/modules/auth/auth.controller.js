@@ -34,7 +34,12 @@ import { env } from '../../config/env.js'
 const getRefreshCookieOptions = () => ({
   httpOnly: true,
   secure:   env.NODE_ENV === 'production',
-  sameSite: env.NODE_ENV === 'production' ? 'strict' : 'lax',
+  // 'none' is required for the cookie to be sent on cross-site requests
+  // (e.g. frontend and backend on different Vercel domains) — this only
+  // works when `secure: true`, which is guaranteed above in production.
+  // Local dev stays on 'lax' since it runs over plain HTTP (no https),
+  // where 'none' would be silently rejected by the browser.
+  sameSite: env.NODE_ENV === 'production' ? 'none' : 'lax',
   maxAge:   7 * 24 * 60 * 60 * 1000, // 7 days in milliseconds
   path:     '/api/v1/auth',           // Restrict cookie to auth routes only
 })
@@ -80,7 +85,7 @@ export const logout = asyncHandler(async (req, res) => {
   res.clearCookie('refreshToken', {
     httpOnly: true,
     secure:   env.NODE_ENV === 'production',
-    sameSite: env.NODE_ENV === 'production' ? 'strict' : 'lax',
+    sameSite: env.NODE_ENV === 'production' ? 'none' : 'lax',
     path:     '/api/v1/auth',
   })
 
