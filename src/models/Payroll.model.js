@@ -78,12 +78,18 @@ const payrollSchema = new Schema(
     salaryType: {
       type:     String,
       enum:     ['monthly', 'daily'],
-      required: [true, 'Salary type snapshot is required'],
+      required: [
+        function () { return this.payrollType !== 'commission' },
+        'Salary type snapshot is required',
+      ],
     },
 
     baseSalary: {
       type:     Number,
-      required: [true, 'Base salary snapshot is required'],
+      required: [
+        function () { return this.payrollType !== 'commission' },
+        'Base salary snapshot is required',
+      ],
       min:      [0, 'Base salary cannot be negative'],
     },
 

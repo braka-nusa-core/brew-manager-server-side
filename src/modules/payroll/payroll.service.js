@@ -69,6 +69,11 @@ export const getPayrolls = async ({ tenantId, user, queryParams }) => {
     query['period.year'] = Number(queryParams.year)
   }
 
+  console.log('===== GET PAYROLL =====')
+  console.log('tenantId :', tenantId)
+  console.log('user.role:', user.role)
+  console.log('user.outletId:', user.outletId)
+  console.log('query:', query)
   const [payrolls, total] = await Promise.all([
     Payroll.find(query)
       .sort({ 'period.year': -1, 'period.month': -1, createdAt: -1 })
@@ -77,6 +82,7 @@ export const getPayrolls = async ({ tenantId, user, queryParams }) => {
       .lean(),
     Payroll.countDocuments(query),
   ])
+  console.log('payroll found:', payrolls.length)
 
   return {
     payrolls,
