@@ -64,6 +64,10 @@ export const login = asyncHandler(async (req, res) => {
 
   // Refresh token goes into a secure httpOnly cookie —
   // never in the response body, never accessible via JavaScript
+  console.log({
+  NODE_ENV: env.NODE_ENV,
+  cookie: getRefreshCookieOptions(),
+})
   res.cookie('refreshToken', refreshToken, getRefreshCookieOptions())
 
   return res.status(200).json(
