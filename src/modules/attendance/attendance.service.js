@@ -462,4 +462,4 @@ export const deleteAttendance = async ({ tenantId, user, attendanceId }) => {
     err.statusCode = 404
     throw err
   }
-}
+} 

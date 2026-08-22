@@ -165,6 +165,20 @@ const employeeSchema = new Schema(
       unique:  true,
       sparse:  true,
     },
+
+    // ── Wallet Config (Phase 2.1 addition) ────────────────────
+    // Per-employee configurable daily allowance amount, in Rupiah.
+    // NOT hardcoded in the wallet service — createDailyCredit() reads
+    // this field and snapshots it onto the ledger entry at write time.
+    // Default 25000 (Rp10,000 meal + Rp15,000 attendance, combined).
+    // Future phases may vary this per rider without any migration —
+    // see EmployeeWalletLedger.model.js for the ledger side.
+
+    dailyAllowanceAmount: {
+      type:    Number,
+      min:     [0, 'Daily allowance amount cannot be negative'],
+      default: 25000,
+    },
   },
   {
     timestamps: true,

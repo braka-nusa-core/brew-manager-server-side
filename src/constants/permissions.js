@@ -78,6 +78,10 @@ export const PERMISSIONS = {
   MANAGE_SUBSCRIPTIONS:    'manage:subscriptions',
   VIEW_SUBSCRIPTIONS:      'view:subscriptions',
   MANAGE_UPGRADE_REQUESTS: 'manage:upgrade_requests',
+
+  // Employee Wallet (Phase 2.1 addition)
+  MANAGE_EMPLOYEE_WALLET: 'manage:employee_wallet',
+  VIEW_EMPLOYEE_WALLET:   'view:employee_wallet',
 }
 
 export const ROLE_PERMISSIONS = {
@@ -115,6 +119,9 @@ export const ROLE_PERMISSIONS = {
     // Sprint 2 — can view own subscription, submit upgrade requests
     PERMISSIONS.VIEW_SUBSCRIPTIONS,
     PERMISSIONS.MANAGE_UPGRADE_REQUESTS,
+    // Phase 2.1 — Employee Wallet
+    PERMISSIONS.MANAGE_EMPLOYEE_WALLET,
+    PERMISSIONS.VIEW_EMPLOYEE_WALLET,
   ],
 
   // Manager: VIEW_USERS removed (Sprint 1) — user management is
@@ -141,6 +148,9 @@ export const ROLE_PERMISSIONS = {
     // Sprint 6.2 — production batch management
     PERMISSIONS.MANAGE_INVENTORY,
     PERMISSIONS.VIEW_INVENTORY,
+    // Phase 2.1 — Employee Wallet
+    PERMISSIONS.MANAGE_EMPLOYEE_WALLET,
+    PERMISSIONS.VIEW_EMPLOYEE_WALLET,
   ],
 
   // Cashier: NO attendance access — attendance is manager/admin only.
@@ -177,5 +187,7 @@ export const ROLE_PERMISSIONS = {
     PERMISSIONS.VIEW_BIKES,
     // Sprint 6.2 — read-only inventory/batch visibility
     PERMISSIONS.VIEW_INVENTORY,
+    // Phase 2.1 — Employee Wallet (read-only, mirrors VIEW_PAYROLL)
+    PERMISSIONS.VIEW_EMPLOYEE_WALLET,
   ],
 }
