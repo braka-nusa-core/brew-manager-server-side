@@ -199,10 +199,12 @@ export const calculateTotalPay = (p) =>
       (p.salaryEarned          ?? 0)
       + (p.cupsBonus             ?? 0)   // legacy field — 0 on new records, preserved for old
       + (p.mealAllowanceTotal    ?? 0)
+      + (p.riderAllowanceTotal   ?? 0)   // Phase 2.6 — wallet-derived, monthly riders only
       + (p.dailyTierBonus        ?? 0)
       + (p.weeklyAttendanceBonus ?? 0)
       + (p.manualBonus           ?? 0)
       - (p.deductions            ?? 0)
       - (p.kasbon                ?? 0)
+      - (p.riderCashAdvanceDeduction ?? 0)   // Phase 3.5 — riders only, auto-computed
     )
   )

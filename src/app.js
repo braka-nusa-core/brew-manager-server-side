@@ -45,6 +45,7 @@ import inventoryRoutes  from './modules/inventory/inventory.routes.js'
 import productionRoutes from './modules/production/production.routes.js'
 import rawMaterialRoutes from './modules/rawMaterial/rawMaterial.routes.js'
 import employeeWalletRoutes from './modules/employeeWallet/employeeWallet.routes.js'
+import cashAdvanceRoutes from './modules/cashAdvance/cashAdvance.routes.js'
 import riderPortalRoutes  from './modules/riderPortal/riderPortal.routes.js'
 import bikeRoutes         from './modules/bike/bike.routes.js'
 import bikeAssignmentRoutes from './modules/bikeAssignment/bikeAssignment.routes.js'
@@ -127,6 +128,7 @@ app.use('/api/v1/inventory',  inventoryRoutes)
 app.use('/api/v1/production', productionRoutes)
 app.use('/api/v1/raw-materials', rawMaterialRoutes)
 app.use('/api/v1/wallet', employeeWalletRoutes)
+app.use('/api/v1/cash-advances', cashAdvanceRoutes)
 
 // ── Public Routes (Phase 6A) ──────────────────────────────────
 // NOT under /api/v1 — deliberate, distinct public namespace.

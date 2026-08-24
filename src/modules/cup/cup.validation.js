@@ -7,6 +7,8 @@
 //   All items must balance. Partial balance is NOT accepted.
 // ============================================================
 
+import { PAYMENT_METHODS } from '../../models/Sale.model.js'   // Phase 3.2
+
 const OBJECT_ID_RE = /^[a-f\d]{24}$/i
 
 const isValidObjectId = (id) =>
@@ -228,4 +230,22 @@ export const validateFinalize = (items, getProductName) => {
       : [],
     breakdown,
   }
+}
+
+// ── validateFinalizePayload ───────────────────────────────────
+// Phase 3.2. Validates the (small, optional) request body for
+// PATCH /:cupRecordId/finalize — just paymentMethod, reusing the exact
+// enum Sale.model.js already defines for manual Sale creation/update.
+
+export const validateFinalizePayload = (body = {}) => {
+  const errors = []
+  const { paymentMethod } = body
+
+  if (paymentMethod !== undefined && paymentMethod !== null) {
+    if (!PAYMENT_METHODS.includes(paymentMethod)) {
+      errors.push(`paymentMethod must be one of: ${PAYMENT_METHODS.join(', ')}`)
+    }
+  }
+
+  return { isValid: errors.length === 0, errors }
 }

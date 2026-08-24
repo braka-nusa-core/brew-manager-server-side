@@ -35,6 +35,8 @@ import {
   loadEmployeeAttendance,
   loadEmployeeSales,
 } from './payrollDataGatherer.js'
+import { getWalletSummary } from '../employeeWallet/employeeWallet.service.js'   // Phase 2.6
+import { claimOutstandingCashAdvances } from '../cashAdvance/cashAdvance.service.js'   // Phase 3.5
 
 // ── generatePayroll ───────────────────────────────────────────
 
@@ -165,7 +167,29 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
 
 
     // ── Step 6: Meal allowance (both types, raw presentDays) ──
-    const mealAllowanceTotal = Math.floor(mealAllowancePerDay * presentDays)
+    // Phase 2.6: forced to 0 for riders — Outlet.mealAllowancePerDay is
+    // the LEGACY allowance calculation and would double-pay against the
+    // Wallet-derived rider allowance (Step 6b) if left active for riders.
+    // Still computed normally for non-rider employees.
+    const mealAllowanceTotal = employee.isRider
+      ? 0
+      : Math.floor(mealAllowancePerDay * presentDays)
+
+    // ── Step 6b: Rider allowance from Wallet (Phase 2.6 addition) ──
+    // Read-only integration — never writes to the wallet.
+    //   'daily'   (default) → 0. Allowance considered paid through the
+    //             wallet directly (withdrawal), not through Payroll.
+    //   'monthly' → sum of this employee's daily_credit entries within
+    //             THIS exact payroll period, via
+    //             getWalletSummary().dailyCreditTotal.
+    let riderAllowanceTotal = 0
+    if (employee.allowancePaymentPeriod === 'monthly') {
+      const walletSummary = await getWalletSummary(employee.tenantId, employeeOid, {
+        startDate: start,
+        endDate:   end,
+      })
+      riderAllowanceTotal = walletSummary.dailyCreditTotal
+    }
 
     // ── Step 7: Daily tier bonus (both types, per-day evaluation) ──
     const { totalBonus: dailyTierBonus, bonusBreakdown } =
@@ -184,17 +208,45 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
     // are refreshed. calculateTotalPay() is reused unchanged either way.
     const manualBonus = existing ? (existing.manualBonus ?? 0) : 0
     const deductions  = existing ? (existing.deductions  ?? 0) : 0
-    const kasbon      = existing ? (existing.kasbon      ?? 0) : 0
+
+    // Phase 3.5: pre-generate the Payroll _id BEFORE it's written, so
+    // Cash Advance records can be "claimed" (tagged with this exact
+    // payroll) before the Payroll document itself exists. For an
+    // existing draft, this is just its own _id; for a new payroll, a
+    // fresh ObjectId is minted here and set explicitly as _id below.
+    const payrollId = existing ? existing._id : new mongoose.Types.ObjectId()
+
+    // Phase 3.5: kasbon no longer auto-populated for riders —
+    // riderCashAdvanceDeduction (below) replaces it, computed from
+    // actual CashAdvance records. Forced to 0 on every rider payroll to
+    // prevent double deduction. Non-rider employees unaffected.
+    const kasbon = employee.isRider
+      ? 0
+      : (existing ? (existing.kasbon ?? 0) : 0)
+
+    // Phase 3.5 — Rider Cash Advance deduction (riders only). Reads
+    // AND claims (tags) outstanding CashAdvance records for this exact
+    // payroll in one call.
+    let riderCashAdvanceDeduction = 0
+    if (employee.isRider) {
+      riderCashAdvanceDeduction = await claimOutstandingCashAdvances(
+        employee.tenantId,
+        employee._id,
+        payrollId
+      )
+    }
 
     const payrollFields = {
       salaryEarned,
       cupsBonus:             0,            // legacy field — explicitly 0 on Phase 4 records
       mealAllowanceTotal,
+      riderAllowanceTotal,   // Phase 2.6
       dailyTierBonus,
       weeklyAttendanceBonus,
       manualBonus,
       deductions,
       kasbon,
+      riderCashAdvanceDeduction,   // Phase 3.5
     }
 
     const totalPay = calculateTotalPay(payrollFields)
@@ -223,6 +275,8 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
       commissionPercentage,
       salaryEarned,
       mealAllowanceTotal,
+      riderAllowanceTotal,   // Phase 2.6
+      riderCashAdvanceDeduction,   // Phase 3.5
       dailyTierBonus,
       weeklyAttendanceBonus,
 
@@ -247,6 +301,7 @@ export const generatePayroll = async ({ tenantId, user, data }) => {
       // ── Create path: unchanged from before ───────────────────
 
       payrollDocs.push({
+        _id:          payrollId,   // Phase 3.5 — pre-generated to match the Cash Advance claim above
         tenantId:     tenantOid ?? undefined,
         outletId:     outletOid,
         employeeId:   employeeOid,

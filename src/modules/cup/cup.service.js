@@ -55,6 +55,21 @@ const addBalanceToItems = (items) =>
     }
   })
 
+// ── Phase 3.1: Automatic Sold Derivation ────────────────────────
+// sold is NO LONGER a trusted client input. Derived server-side:
+//   carried = distributed + refill
+//   sold    = max(0, carried - returned - reject)
+// Clamped to 0 (not left negative) so drafts always save successfully
+// (schema's sold min:0 would otherwise throw on over-committed
+// intermediate draft states). The clamp doesn't hide over-commitment —
+// when returned+reject > carried, clamped sold=0 makes accounted
+// exceed carried, which the EXISTING validateFinalize() balance check
+// already rejects, unmodified.
+const deriveSold = (distributed, refill, returned, reject) => {
+  const carried = (distributed ?? 0) + (refill ?? 0)
+  return Math.max(0, carried - (returned ?? 0) - (reject ?? 0))
+}
+
 // ── Phase 1: dispatch/refill log helpers ────────────────────────
 
 /**
@@ -93,7 +108,8 @@ const buildItemWithInitialDispatchLog = (
     productId:    new mongoose.Types.ObjectId(item.productId),
     distributed,
     refill:       item.refill ?? 0,
-    sold:         item.sold ?? 0,
+    // Phase 3.1: sold is derived, NOT read from item.sold.
+    sold:         deriveSold(distributed, item.refill ?? 0, item.returned ?? 0, item.reject ?? 0),
     returned:     item.returned ?? 0,
     reject:       item.reject ?? 0,
     dispatchLogs,
@@ -135,14 +151,19 @@ const overwriteItemsPreservingLogs = (existingItems, newItems) => {
 
   return newItems.map((item) => {
     const existing = existingByProduct.get(item.productId.toString())
+    const distributed = item.distributed ?? 0
+    const refill       = item.refill ?? 0
+    const returned      = item.returned ?? 0
+    const reject          = item.reject ?? 0
 
     return {
       productId:    new mongoose.Types.ObjectId(item.productId),
-      distributed:  item.distributed ?? 0,
-      refill:       item.refill ?? 0,
-      sold:         item.sold ?? 0,
-      returned:     item.returned ?? 0,
-      reject:       item.reject ?? 0,
+      distributed,
+      refill,
+      // Phase 3.1: derived, not read from item.sold.
+      sold:         deriveSold(distributed, refill, returned, reject),
+      returned,
+      reject,
       dispatchLogs: existing ? existing.dispatchLogs : [],
       refillLogs:   existing ? existing.refillLogs : [],
     }
@@ -165,7 +186,7 @@ const overwriteItemsPreservingLogs = (existingItems, newItems) => {
  * @param {Object} record - the finalized CupRecord (mongoose doc, plain items ok)
  * @param {string} userId - who finalized (becomes recordedBy)
  */
-const generateSaleFromCupRecord = async (session, record, userId) => {
+const generateSaleFromCupRecord = async (session, record, userId, paymentMethod = null) => {
   const productIds = record.items.map((i) => i.productId)
   const products    = await Product.find({ _id: { $in: productIds } }).session(session).lean()
   const priceMap     = new Map(products.map((p) => [p._id.toString(), p.sellingPrice ?? 0]))
@@ -194,6 +215,7 @@ const generateSaleFromCupRecord = async (session, record, userId) => {
         sourceCupRecordId: record._id,
         recordedBy:        new mongoose.Types.ObjectId(userId),
         notes:             'Auto-generated from CupRecord finalize',
+        paymentMethod:     paymentMethod ?? null,   // Phase 3.2
       },
     },
     { upsert: true, new: true, setDefaultsOnInsert: true, session }
@@ -585,7 +607,7 @@ export const addCupRefill = async (tenantId, cupRecordId, data, userId) => {
  * @param {string} cupRecordId
  * @param {string} userId - who is finalizing
  */
-export const finalizeCupRecord = async (tenantId, cupRecordId, userId) => {
+export const finalizeCupRecord = async (tenantId, cupRecordId, userId, paymentMethod = null) => {
   const session = await mongoose.startSession()
   let result
 
@@ -662,7 +684,7 @@ export const finalizeCupRecord = async (tenantId, cupRecordId, userId) => {
       // Sale collection, so this record is picked up automatically the
       // next time they run. Content doesn't depend on record.status, so
       // it's safe to generate before the status flip below.
-      await generateSaleFromCupRecord(session, record.toObject(), userId)
+      await generateSaleFromCupRecord(session, record.toObject(), userId, paymentMethod)
 
       // ── Steps 6-7: Mark CupRecord finalized + save ──
       record.status      = 'finalized'

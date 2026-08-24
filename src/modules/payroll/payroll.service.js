@@ -24,6 +24,7 @@ import Payroll   from '../../models/Payroll.model.js'
 import ApiError  from '../../utils/ApiError.js'
 import { buildPaginationQuery, buildPaginationMeta } from '../../utils/pagination.js'
 import { ROLES } from '../../constants/permissions.js'
+import { settleCashAdvancesForPayroll } from '../cashAdvance/cashAdvance.service.js'   // Phase 3.5
 
 // ── Step 3: persistence + calculation now live in payrollSnapshotService.js ──
 export { generatePayroll } from './payrollSnapshotService.js'
@@ -219,6 +220,13 @@ export const markPayrollPaid = async ({ tenantId, user, payrollId }) => {
 
   payroll.status = 'paid'
   await payroll.save()
+
+  // Phase 3.5 — the moment a payroll actually reaches 'paid' (the
+  // project's existing, established settlement point) is exactly when
+  // the Cash Advance records this payroll claimed at generation time
+  // become 'settled'. Never fires for draft/approved. No-op for
+  // non-rider payrolls, which never claim anything.
+  await settleCashAdvancesForPayroll(payroll._id)
 
   return payroll.toObject()
 }

@@ -12,8 +12,7 @@
 // intended to become the single financial ledger for every employee
 // across multiple future transaction types (daily allowance, kasbon,
 // bonus, reimbursement, manual correction) — not a daily-allowance-only
-// mechanism. Phase 2.1 only builds the ledger + basic transaction types;
-// it does not wire any automation into it.
+// mechanism.
 //
 // Rules (same as InventoryTransaction):
 //   - Never updated after creation.
@@ -28,15 +27,15 @@ import mongoose from 'mongoose'
 
 const { Schema, model } = mongoose
 
-// Enum kept intentionally small for Phase 2.1. Do not add types beyond
-// this list without a deliberate follow-up decision — each new type is
-// a new kind of financial event the ledger must be able to explain.
+// Enum kept intentionally small. Do not add types beyond this list
+// without a deliberate follow-up decision — each new type is a new
+// kind of financial event the ledger must be able to explain.
 export const WALLET_TRANSACTION_TYPES = [
-  'daily_credit',   // future: automatic per-attendance-day credit
+  'daily_credit',   // automatic per-attendance-day credit
   'withdrawal',      // employee draws down their balance
   'adjustment',       // generic signed correction
-  'manual_credit',      // admin-entered credit (e.g. bonus, reimbursement — future phases)
-  'manual_debit',         // admin-entered debit (e.g. kasbon — future phases)
+  'manual_credit',      // admin-entered credit (e.g. bonus, reimbursement)
+  'manual_debit',         // admin-entered debit
   'migration',              // backfill / data-migration entries
 ]
 
@@ -90,11 +89,8 @@ const employeeWalletLedgerSchema = new Schema(
     },
 
     // ── Signed amount applied to the wallet balance ─────────────
-    // +amount for credits (daily_credit, manual_credit, positive
-    // adjustment), -amount for debits (withdrawal, manual_debit,
-    // negative adjustment). Sign convention lives in the service
-    // layer — this field simply stores whatever signed value was
-    // computed there.
+    // +amount for credits, -amount for debits. Sign convention lives
+    // in the service layer.
 
     amount: {
       type:     Number,
@@ -106,11 +102,6 @@ const employeeWalletLedgerSchema = new Schema(
     },
 
     // ── Running balance snapshot AFTER this transaction is applied ──
-    // balanceAfter = (previous entry's balanceAfter, or 0 if none) + amount.
-    // Stored so history/reporting reads never need to replay the full
-    // ledger — but the ledger itself remains the reconstructable source
-    // of truth (balanceAfter values can always be recomputed from
-    // amount history alone if ever needed).
 
     balanceAfter: {
       type:     Number,
@@ -134,22 +125,29 @@ const employeeWalletLedgerSchema = new Schema(
     },
   },
   {
-    timestamps: { createdAt: true, updatedAt: false }, // append-only, same as InventoryTransaction
+    timestamps: { createdAt: true, updatedAt: false }, // append-only
     versionKey: false,
   }
 )
 
 // ── Indexes ───────────────────────────────────────────────────
 
-// Per-employee ledger replay, ordered by write time — the query used
-// to derive "current balance" (latest balanceAfter) and full history.
 employeeWalletLedgerSchema.index({ tenantId: 1, employeeId: 1, createdAt: 1 })
-
-// "What happened on day X" lookups.
 employeeWalletLedgerSchema.index({ tenantId: 1, employeeId: 1, date: 1 })
-
-// Reporting by outlet over time (snapshot outletId — see note above).
 employeeWalletLedgerSchema.index({ tenantId: 1, outletId: 1, date: -1 })
+
+// DUPLICATE-CREDIT GUARANTEE (Phase 2.2):
+// One employee + one calendar date = at most one daily_credit entry,
+// enforced at the DATABASE level via a partial unique index (scoped
+// only to type: 'daily_credit' — withdrawals/adjustments/manual
+// entries may legitimately occur multiple times on the same date).
+employeeWalletLedgerSchema.index(
+  { tenantId: 1, employeeId: 1, date: 1, type: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { type: 'daily_credit' },
+  }
+)
 
 const EmployeeWalletLedger = model('EmployeeWalletLedger', employeeWalletLedgerSchema)
 

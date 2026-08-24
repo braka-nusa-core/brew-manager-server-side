@@ -82,6 +82,11 @@ export const PERMISSIONS = {
   // Employee Wallet (Phase 2.1 addition)
   MANAGE_EMPLOYEE_WALLET: 'manage:employee_wallet',
   VIEW_EMPLOYEE_WALLET:   'view:employee_wallet',
+
+  // Cash Advance (Phase 3.5 addition) — deliberately separate from
+  // both MANAGE_EMPLOYEE_WALLET and MANAGE_PAYROLL.
+  MANAGE_CASH_ADVANCE: 'manage:cash_advance',
+  VIEW_CASH_ADVANCE:   'view:cash_advance',
 }
 
 export const ROLE_PERMISSIONS = {
@@ -122,6 +127,9 @@ export const ROLE_PERMISSIONS = {
     // Phase 2.1 — Employee Wallet
     PERMISSIONS.MANAGE_EMPLOYEE_WALLET,
     PERMISSIONS.VIEW_EMPLOYEE_WALLET,
+    // Phase 3.5 — Cash Advance
+    PERMISSIONS.MANAGE_CASH_ADVANCE,
+    PERMISSIONS.VIEW_CASH_ADVANCE,
   ],
 
   // Manager: VIEW_USERS removed (Sprint 1) — user management is
@@ -151,6 +159,9 @@ export const ROLE_PERMISSIONS = {
     // Phase 2.1 — Employee Wallet
     PERMISSIONS.MANAGE_EMPLOYEE_WALLET,
     PERMISSIONS.VIEW_EMPLOYEE_WALLET,
+    // Phase 3.5 — Cash Advance
+    PERMISSIONS.MANAGE_CASH_ADVANCE,
+    PERMISSIONS.VIEW_CASH_ADVANCE,
   ],
 
   // Cashier: NO attendance access — attendance is manager/admin only.
@@ -189,5 +200,7 @@ export const ROLE_PERMISSIONS = {
     PERMISSIONS.VIEW_INVENTORY,
     // Phase 2.1 — Employee Wallet (read-only, mirrors VIEW_PAYROLL)
     PERMISSIONS.VIEW_EMPLOYEE_WALLET,
+    // Phase 3.5 — Cash Advance (read-only)
+    PERMISSIONS.VIEW_CASH_ADVANCE,
   ],
 }

@@ -13,6 +13,7 @@ import {
   getAttendanceSummary,
   getEmployeePerformance,
   getProductMargins,
+  getDailyPaymentSummary,
 } from './dashboard.service.js'
 
 // ── GET /api/v1/dashboard/summary ────────────────────────────
@@ -84,4 +85,16 @@ export const productMargins = asyncHandler(async (req, res) => {
   const data = await getProductMargins(req.tenantId)
 
   return res.status(200).json(successResponse('Product margins retrieved', data))
+})
+
+// ── GET /api/v1/dashboard/daily-payment-summary (Phase 3.3) ────
+
+export const dailyPaymentSummary = asyncHandler(async (req, res) => {
+  const data = await getDailyPaymentSummary({
+    tenantId:    req.tenantId,
+    user:        req.user,
+    queryParams: req.query,
+  })
+
+  return res.status(200).json(successResponse('Daily payment summary retrieved', data))
 })

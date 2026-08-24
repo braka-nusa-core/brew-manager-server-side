@@ -13,6 +13,7 @@ import {
   validateCreateCupRecord,
   validateUpdateCupRecord,
   validateAddRefill,
+  validateFinalizePayload,
 } from './cup.validation.js'
 import {
   createCupRecord,
@@ -124,10 +125,17 @@ export const addRefill = asyncHandler(async (req, res) => {
 // MUST be registered before /:cupRecordId in routes.
 
 export const finalize = asyncHandler(async (req, res) => {
+  // Phase 3.2: optional paymentMethod ('cash'|'transfer'|'qris').
+  const { isValid, errors } = validateFinalizePayload(req.body)
+  if (!isValid) {
+    return res.status(400).json(errorResponse('Validation failed', 400, errors))
+  }
+
   const record = await finalizeCupRecord(
     req.tenantId,
     req.params.cupRecordId,
-    req.user.userId
+    req.user.userId,
+    req.body?.paymentMethod ?? null
   )
 
   return res.status(200).json(

@@ -1,35 +1,43 @@
 // ============================================================
 // modules/employeeWallet/employeeWallet.service.js
 // Phase 2.1 — Employee Wallet foundation.
-// Phase 2.1 refinement pass — architectural cleanup only, no business
-// logic change:
-//   - Single internal createLedgerEntry() helper now backs every
-//     transaction type (daily_credit, withdrawal, adjustment, and the
-//     not-yet-routed manual_credit/manual_debit/migration).
-//   - Every ledger write now runs inside a mongoose session transaction
-//     (session.withTransaction), matching the consistency guarantee
-//     inventory.service.js's consumeFifo() already provides — the
-//     previous read-then-write balance computation is no longer
-//     susceptible to a concurrent-write race.
+// Phase 2.1 FINAL revision — transaction ownership moved to the caller:
+//   - createLedgerEntry(session, payload) REQUIRES a caller-owned
+//     session and never opens/commits its own transaction — exactly
+//     like consumeFifo(session, {...}) in inventory.service.js.
+//   - createDailyCredit()/createWithdrawal()/createAdjustment() each
+//     own startSession()/withTransaction() themselves and pass
+//     `session` into createLedgerEntry().
+//
+// Phase 2.2 — automatic daily allowance credit, wired into Attendance:
+//   - createDailyCreditInSession(session, payload) added: the actual
+//     daily-credit business logic, callable with a CALLER-owned
+//     session — this is what attendance.service.js#ensurePresentAttendance
+//     calls directly using CupRecord creation's existing session.
+//   - createDailyCredit({...}) is a thin wrapper: opens its own
+//     session, delegates to createDailyCreditInSession().
+//
+// Phase 2.3 — read/reporting foundation, no write-behavior change:
+//   - getWalletSummary(tenantId, employeeId, {startDate?, endDate?})
+//     added: aggregation-based credits/withdrawals/adjustments/netChange
+//     breakdown over an optional date range, plus the TRUE current
+//     balance (never limited by the requested range).
+//   - getEmployeeWalletOverview(tenantId, employeeId) added: combines
+//     Employee identity/config fields with the derived balance —
+//     service-level only, no dedicated route.
+//
+// Phase 2.4 — manual wallet transactions:
+//   - createManualEntry({tenantId, employeeId, type, amount, date,
+//     createdBy, notes}) added: wires the previously schema-only
+//     manual_credit/manual_debit types to an actual write path.
+//     External `amount` is always positive; sign resolved internally.
+//     manual_debit reuses evaluateWithdrawalRule() for the overdraw
+//     check. No Payroll interaction of any kind.
 //
 // Owns all EmployeeWalletLedger read/write logic. This is the ONLY
 // module allowed to write EmployeeWalletLedger documents — mirrors the
 // "one writer" convention already used by inventory.service.js for
 // InventoryTransaction/InventoryBatch.
-//
-// Scope of this phase (Phase 2.1) — foundation only:
-//   - getCurrentBalance()
-//   - createDailyCredit()
-//   - createWithdrawal()
-//   - createAdjustment()
-//   - listLedgerHistory() (supporting read for the GET history route)
-//
-// Explicitly OUT of scope for this phase:
-//   - No Attendance integration (nothing calls createDailyCredit()
-//     automatically — it is exposed as a service method only).
-//   - No Payroll integration.
-//   - No kasbon/bonus/reimbursement business logic beyond the generic
-//     manual_credit/manual_debit/adjustment types already on the enum.
 // ============================================================
 
 import mongoose             from 'mongoose'
@@ -47,12 +55,7 @@ const toMidnightUTC = (dateInput) => {
 
 /**
  * Loads and tenant-validates the employee this wallet transaction is for.
- * Returns the lean Employee doc (used for outletId snapshot and, for
- * daily credits, dailyAllowanceAmount).
- *
- * @param {import('mongoose').ClientSession} [session] - threaded through
- *   when called from inside a transaction (write paths); omitted for
- *   plain reads.
+ * @param {import('mongoose').ClientSession} [session]
  */
 const loadEmployee = async (tenantId, employeeId, session = null) => {
   let query = Employee.findOne({
@@ -71,20 +74,18 @@ const loadEmployee = async (tenantId, employeeId, session = null) => {
 }
 
 /**
- * Withdrawal eligibility rule, isolated on purpose so it can become
- * configurable later (e.g. per-outlet or per-tenant overdraw allowance)
- * without restructuring createLedgerEntry()/createWithdrawal() itself.
- * Phase 2.1: fixed rule — withdrawal cannot exceed current balance.
+ * Overdraw-prevention rule — a debit (withdrawal OR manual_debit)
+ * cannot exceed the current balance. Isolated so it can become
+ * configurable later without restructuring createLedgerEntry()/
+ * createWithdrawal()/createManualEntry() themselves.
  *
- * @param {number} currentBalance
- * @param {number} amount - positive withdrawal amount requested
- * @returns {{ allowed: boolean, reason?: string }}
+ * @param {string} [label] - 'Withdrawal' (default) or 'Manual debit'
  */
-const evaluateWithdrawalRule = (currentBalance, amount) => {
+const evaluateWithdrawalRule = (currentBalance, amount, label = 'Withdrawal') => {
   if (amount > currentBalance) {
     return {
       allowed: false,
-      reason:  `Withdrawal amount (${amount}) exceeds current balance (${currentBalance})`,
+      reason:  `${label} amount (${amount}) exceeds current balance (${currentBalance})`,
     }
   }
   return { allowed: true }
@@ -94,17 +95,10 @@ const evaluateWithdrawalRule = (currentBalance, amount) => {
 
 /**
  * Derives an employee's current wallet balance from the ledger.
- * Balance is never stored on Employee — this always reads the most
- * recent ledger entry's balanceAfter (ordered by createdAt), falling
- * back to 0 when the employee has no ledger entries yet.
+ * Balance is never stored on Employee — always the most recent
+ * ledger entry's balanceAfter, falling back to 0 if none exist.
  *
- * @param {string} tenantId
- * @param {string} employeeId
- * @param {import('mongoose').ClientSession} [session] - threaded through
- *   when called from inside createLedgerEntry()'s transaction, so the
- *   balance read and the entry it's based on are part of the same
- *   snapshot; omitted for standalone reads (e.g. the GET balance route).
- * @returns {Promise<number>}
+ * @param {import('mongoose').ClientSession} [session]
  */
 export const getCurrentBalance = async (tenantId, employeeId, session = null) => {
   let query = EmployeeWalletLedger.findOne({
@@ -119,39 +113,14 @@ export const getCurrentBalance = async (tenantId, employeeId, session = null) =>
 }
 
 // ── createLedgerEntry ────────────────────────────────────────
-// Single internal writer used by EVERY transaction type — daily_credit,
-// withdrawal, adjustment, and the not-yet-routed manual_credit/
-// manual_debit/migration. This is the only place balanceAfter is
-// computed (previousBalance -> newBalance -> balanceAfter) and the
-// only place that opens/commits the session transaction, so every
-// caller gets the same consistency guarantee without duplicating it.
-//
-// Runs entirely inside session.withTransaction(): the balance read and
-// the ledger write happen in the same session, so two concurrent calls
-// for the same employee can no longer race on the same previousBalance
-// (the second transaction sees the first's committed write, or the two
-// are serialized/one retried by the driver — same guarantee
-// consumeFifo() already relies on for InventoryBatch).
-//
-// NOT exported for arbitrary external use — each transaction type gets
-// its own thin, type-specific wrapper below (createDailyCredit,
-// createWithdrawal, createAdjustment) that validates its own
-// preconditions (withdrawal-vs-balance, adjustment requires notes,
-// etc.) before delegating here. This keeps createLedgerEntry() itself
-// free of any single type's business rules.
-//
-// @param {Object} params
-// @param {string} params.tenantId
-// @param {string} params.outletId
-// @param {string} params.employeeId
-// @param {string|Date} params.date
-// @param {string} params.type - one of WALLET_TRANSACTION_TYPES
-// @param {number} params.amount - already signed (+credit / -debit)
-// @param {string} [params.notes]
-// @param {string} params.createdBy
-const createLedgerEntry = async ({
+// Single internal writer used by EVERY transaction type. Requires a
+// caller-owned session — never opens/commits its own transaction.
+const createLedgerEntry = async (session, {
   tenantId, outletId, employeeId, date, type, amount, notes, createdBy,
 }) => {
+  if (!session) {
+    throw new ApiError(500, 'createLedgerEntry requires a caller-owned mongoose session')
+  }
   if (!WALLET_TRANSACTION_TYPES.includes(type)) {
     throw new ApiError(400, `type must be one of: ${WALLET_TRANSACTION_TYPES.join(', ')}`)
   }
@@ -159,27 +128,66 @@ const createLedgerEntry = async ({
     throw new ApiError(400, 'amount must be a non-zero finite number')
   }
 
+  const currentBalance = await getCurrentBalance(tenantId, employeeId, session)
+  const balanceAfter   = currentBalance + amount
+
+  const created = await EmployeeWalletLedger.create([{
+    tenantId:   new mongoose.Types.ObjectId(tenantId),
+    outletId:   new mongoose.Types.ObjectId(outletId),
+    employeeId: new mongoose.Types.ObjectId(employeeId),
+    date:       toMidnightUTC(date),
+    type,
+    amount,
+    balanceAfter,
+    notes:      notes?.trim() ?? null,
+    createdBy:  new mongoose.Types.ObjectId(createdBy),
+  }], { session })
+
+  return created[0].toObject()
+}
+
+// ── createDailyCreditInSession ───────────────────────────────
+// Phase 2.2. Session-aware daily-credit core logic — callable from
+// INSIDE an already-open transaction (attendance.service.js).
+export const createDailyCreditInSession = async (session, { tenantId, employeeId, date, createdBy, notes }) => {
+  if (!session) {
+    throw new ApiError(500, 'createDailyCreditInSession requires a caller-owned mongoose session')
+  }
+
+  const employee = await loadEmployee(tenantId, employeeId, session)
+
+  if (!employee.isActive) {
+    throw new ApiError(400, 'Employee is inactive and cannot be credited a daily allowance')
+  }
+
+  const amount = employee.dailyAllowanceAmount ?? 25000
+
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+    throw new ApiError(400, 'Employee dailyAllowanceAmount must be greater than 0 to credit')
+  }
+
+  return createLedgerEntry(session, {
+    tenantId,
+    outletId:   employee.outletId,
+    employeeId,
+    date,
+    type:       'daily_credit',
+    amount,
+    notes:      notes ?? 'Daily allowance credit',
+    createdBy,
+  })
+}
+
+// ── createDailyCredit ────────────────────────────────────────
+// Public, HTTP-facing-shaped wrapper (no session parameter) — owns
+// its own session/transaction, delegates to createDailyCreditInSession().
+export const createDailyCredit = async ({ tenantId, employeeId, date, createdBy, notes }) => {
   const session = await mongoose.startSession()
   let result
 
   try {
     await session.withTransaction(async () => {
-      const currentBalance = await getCurrentBalance(tenantId, employeeId, session)
-      const balanceAfter   = currentBalance + amount
-
-      const created = await EmployeeWalletLedger.create([{
-        tenantId:   new mongoose.Types.ObjectId(tenantId),
-        outletId:   new mongoose.Types.ObjectId(outletId),
-        employeeId: new mongoose.Types.ObjectId(employeeId),
-        date:       toMidnightUTC(date),
-        type,
-        amount,
-        balanceAfter,
-        notes:      notes?.trim() ?? null,
-        createdBy:  new mongoose.Types.ObjectId(createdBy),
-      }], { session })
-
-      result = created[0].toObject()
+      result = await createDailyCreditInSession(session, { tenantId, employeeId, date, createdBy, notes })
     })
   } finally {
     await session.endSession()
@@ -188,63 +196,8 @@ const createLedgerEntry = async ({
   return result
 }
 
-// ── createDailyCredit ────────────────────────────────────────
-
-/**
- * Credits one day's allowance to an employee's wallet.
- * Amount is NEVER hardcoded here — it is read from
- * Employee.dailyAllowanceAmount and snapshotted onto the ledger entry,
- * so a later change to that field never rewrites history.
- *
- * Phase 2.1: exposed as a plain service method only. Nothing calls
- * this automatically yet — no Attendance integration in this phase.
- *
- * @param {Object} params
- * @param {string} params.tenantId
- * @param {string} params.employeeId
- * @param {string|Date} params.date
- * @param {string} params.createdBy
- * @param {string} [params.notes]
- */
-export const createDailyCredit = async ({ tenantId, employeeId, date, createdBy, notes }) => {
-  const employee = await loadEmployee(tenantId, employeeId)
-  const amount   = employee.dailyAllowanceAmount ?? 25000
-
-  if (amount <= 0) {
-    throw new ApiError(400, 'Employee dailyAllowanceAmount must be greater than 0 to credit')
-  }
-
-  return createLedgerEntry({
-    tenantId,
-    outletId:   employee.outletId,
-    employeeId,
-    date,
-    type:       'daily_credit',
-    amount,      // positive — credit
-    notes:      notes ?? 'Daily allowance credit',
-    createdBy,
-  })
-}
-
 // ── createWithdrawal ─────────────────────────────────────────
 
-/**
- * Records a withdrawal against an employee's wallet balance.
- * `amount` is provided as a positive number (the amount being
- * withdrawn); it is stored as a negative ledger amount.
- *
- * Current rule (Phase 2.1, fixed): withdrawal cannot exceed balance.
- * See evaluateWithdrawalRule() — isolated so this restriction can
- * become configurable later without touching this function's shape.
- *
- * @param {Object} params
- * @param {string} params.tenantId
- * @param {string} params.employeeId
- * @param {number} params.amount - positive amount to withdraw
- * @param {string|Date} params.date
- * @param {string} params.createdBy
- * @param {string} [params.notes]
- */
 export const createWithdrawal = async ({ tenantId, employeeId, amount, date, createdBy, notes }) => {
   if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
     throw new ApiError(400, 'Withdrawal amount must be a positive number')
@@ -257,41 +210,31 @@ export const createWithdrawal = async ({ tenantId, employeeId, amount, date, cre
     throw new ApiError(400, reason)
   }
 
-  // Note: the eligibility check above reads the balance OUTSIDE the
-  // write transaction (so an over-limit withdrawal gets a clean 400
-  // without opening a session at all). createLedgerEntry() re-reads
-  // the balance INSIDE its own transaction as the authoritative value
-  // the write is based on, so the final balanceAfter is always correct
-  // even if the balance moved between this pre-check and the write.
-  return createLedgerEntry({
-    tenantId,
-    outletId:   employee.outletId,
-    employeeId,
-    date,
-    type:       'withdrawal',
-    amount:     -amount,  // negative — debit
-    notes,
-    createdBy,
-  })
+  const session = await mongoose.startSession()
+  let result
+
+  try {
+    await session.withTransaction(async () => {
+      result = await createLedgerEntry(session, {
+        tenantId,
+        outletId:   employee.outletId,
+        employeeId,
+        date,
+        type:       'withdrawal',
+        amount:     -amount,
+        notes,
+        createdBy,
+      })
+    })
+  } finally {
+    await session.endSession()
+  }
+
+  return result
 }
 
 // ── createAdjustment ─────────────────────────────────────────
 
-/**
- * Records a manual signed correction against an employee's wallet.
- * `amount` is provided already signed (positive = credit correction,
- * negative = debit correction) — unlike createWithdrawal, which takes
- * an unsigned magnitude, because an adjustment can go either direction
- * and the caller should be explicit about which.
- *
- * @param {Object} params
- * @param {string} params.tenantId
- * @param {string} params.employeeId
- * @param {number} params.amount - signed adjustment amount
- * @param {string|Date} params.date
- * @param {string} params.createdBy
- * @param {string} params.notes - required, explains the correction
- */
 export const createAdjustment = async ({ tenantId, employeeId, amount, date, createdBy, notes }) => {
   if (typeof amount !== 'number' || !Number.isFinite(amount) || amount === 0) {
     throw new ApiError(400, 'Adjustment amount must be a non-zero number')
@@ -303,27 +246,190 @@ export const createAdjustment = async ({ tenantId, employeeId, amount, date, cre
 
   const employee = await loadEmployee(tenantId, employeeId)
 
-  return createLedgerEntry({
-    tenantId,
-    outletId:   employee.outletId,
+  const session = await mongoose.startSession()
+  let result
+
+  try {
+    await session.withTransaction(async () => {
+      result = await createLedgerEntry(session, {
+        tenantId,
+        outletId:   employee.outletId,
+        employeeId,
+        date,
+        type:       'adjustment',
+        amount,
+        notes,
+        createdBy,
+      })
+    })
+  } finally {
+    await session.endSession()
+  }
+
+  return result
+}
+
+// ── createManualEntry ────────────────────────────────────────
+// Phase 2.4. Single public function covering BOTH manual_credit and
+// manual_debit. External API always takes a POSITIVE `amount` for
+// both types; converted to the correct signed ledger amount internally.
+export const createManualEntry = async ({ tenantId, employeeId, type, amount, date, createdBy, notes }) => {
+  if (type !== 'manual_credit' && type !== 'manual_debit') {
+    throw new ApiError(400, "type must be one of: manual_credit, manual_debit")
+  }
+
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+    throw new ApiError(400, 'amount must be a positive finite number')
+  }
+
+  if (!notes || !notes.trim()) {
+    throw new ApiError(400, 'notes is required for a manual wallet transaction (explain the reason)')
+  }
+
+  const employee = await loadEmployee(tenantId, employeeId)
+
+  if (!employee.isActive) {
+    throw new ApiError(400, 'Employee is inactive and cannot receive a manual wallet transaction')
+  }
+
+  const signedAmount = type === 'manual_credit' ? amount : -amount
+
+  if (type === 'manual_debit') {
+    const currentBalance      = await getCurrentBalance(tenantId, employeeId)
+    const { allowed, reason } = evaluateWithdrawalRule(currentBalance, amount, 'Manual debit')
+    if (!allowed) {
+      throw new ApiError(400, reason)
+    }
+  }
+
+  const session = await mongoose.startSession()
+  let result
+
+  try {
+    await session.withTransaction(async () => {
+      result = await createLedgerEntry(session, {
+        tenantId,
+        outletId:   employee.outletId,
+        employeeId,
+        date,
+        type,
+        amount:     signedAmount,
+        notes,
+        createdBy,
+      })
+    })
+  } finally {
+    await session.endSession()
+  }
+
+  return result
+}
+
+// ── getWalletSummary ─────────────────────────────────────────
+// Phase 2.3, extended Phase 2.6 (dailyCreditTotal bucket for Payroll).
+export const getWalletSummary = async (tenantId, employeeId, range = {}) => {
+  await loadEmployee(tenantId, employeeId)
+
+  const tenantOid   = new mongoose.Types.ObjectId(tenantId)
+  const employeeOid = new mongoose.Types.ObjectId(employeeId)
+
+  const match = { tenantId: tenantOid, employeeId: employeeOid }
+
+  let startDate = null
+  let endDate   = null
+
+  if (range.startDate || range.endDate) {
+    match.date = {}
+    if (range.startDate) {
+      startDate    = toMidnightUTC(range.startDate)
+      match.date.$gte = startDate
+    }
+    if (range.endDate) {
+      endDate      = toMidnightUTC(range.endDate)
+      match.date.$lte = endDate
+    }
+  }
+
+  const [agg] = await EmployeeWalletLedger.aggregate([
+    { $match: match },
+    {
+      $group: {
+        _id: null,
+        totalCredits: {
+          $sum: {
+            $cond: [{ $in: ['$type', ['daily_credit', 'manual_credit']] }, '$amount', 0],
+          },
+        },
+        // Phase 2.6 addition — pure daily_credit-only total, distinct
+        // from totalCredits above (which also includes manual_credit).
+        // Payroll's rider-allowance integration needs specifically the
+        // attendance-driven daily_credit sum.
+        dailyCreditTotal: {
+          $sum: {
+            $cond: [{ $eq: ['$type', 'daily_credit'] }, '$amount', 0],
+          },
+        },
+        totalWithdrawals: {
+          $sum: {
+            $cond: [{ $in: ['$type', ['withdrawal', 'manual_debit']] }, { $abs: '$amount' }, 0],
+          },
+        },
+        totalAdjustments: {
+          $sum: {
+            $cond: [{ $eq: ['$type', 'adjustment'] }, '$amount', 0],
+          },
+        },
+        netChange: { $sum: '$amount' },
+      },
+    },
+  ])
+
+  const currentBalance = await getCurrentBalance(tenantId, employeeId)
+
+  return {
     employeeId,
-    date,
-    type:       'adjustment',
-    amount,
-    notes,
-    createdBy,
+    startDate:        startDate ? startDate.toISOString() : null,
+    endDate:          endDate ? endDate.toISOString() : null,
+    totalCredits:     agg?.totalCredits ?? 0,
+    dailyCreditTotal: agg?.dailyCreditTotal ?? 0,
+    totalWithdrawals: agg?.totalWithdrawals ?? 0,
+    totalAdjustments: agg?.totalAdjustments ?? 0,
+    netChange:        agg?.netChange ?? 0,
+    currentBalance,
+  }
+}
+
+// ── getEmployeeWalletOverview ────────────────────────────────
+// Phase 2.3, extended Phase 2.5 (allowancePaymentPeriod). Service-level
+// only — no dedicated route.
+export const getEmployeeWalletOverview = async (tenantId, employeeId) => {
+  const employee = await Employee.findOne({
+    _id:      new mongoose.Types.ObjectId(employeeId),
+    tenantId: new mongoose.Types.ObjectId(tenantId),
   })
+    .populate('outletId', 'name')
+    .lean()
+
+  if (!employee) {
+    throw new ApiError(404, 'Employee not found')
+  }
+
+  const currentBalance = await getCurrentBalance(tenantId, employeeId)
+
+  return {
+    employeeId:             employee._id,
+    employeeName:           employee.name,
+    outletId:               employee.outletId?._id ?? null,
+    outletName:             employee.outletId?.name ?? null,
+    isActive:               employee.isActive,
+    dailyAllowanceAmount:   employee.dailyAllowanceAmount ?? 25000,
+    allowancePaymentPeriod: employee.allowancePaymentPeriod ?? 'daily',
+    currentBalance,
+  }
 }
 
 // ── listLedgerHistory ────────────────────────────────────────
 
-/**
- * Paginated ledger history for one employee, tenant/outlet-safe.
- *
- * @param {string} tenantId
- * @param {string} employeeId
- * @param {Object} queryParams - { page, limit, type, startDate, endDate }
- */
 export const listLedgerHistory = async (tenantId, employeeId, queryParams = {}) => {
   const { page, limit, skip } = buildPaginationQuery(queryParams)
 

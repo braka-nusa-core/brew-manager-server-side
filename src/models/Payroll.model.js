@@ -216,6 +216,31 @@ const payrollSchema = new Schema(
       min:     [0, 'Kasbon cannot be negative'],
     },
 
+    // ── Rider Allowance Total (Phase 2.6 addition) ────────────
+    // Populated ONLY for riders with allowancePaymentPeriod === 'monthly':
+    // sum of that employee's Wallet daily_credit entries within this
+    // payroll period, via getWalletSummary().dailyCreditTotal. 0 for
+    // 'daily'-configured riders and 0 for non-rider employees.
+
+    riderAllowanceTotal: {
+      type:    Number,
+      default: 0,
+      min:     [0, 'Rider allowance total cannot be negative'],
+    },
+
+    // ── Rider Cash Advance Deduction (Phase 3.5 addition) ─────
+    // Automatically computed at Payroll generation, RIDERS ONLY, from
+    // CashAdvance records claimed by this payroll. Never manually
+    // entered. 0 for every non-rider employee. kasbon above is forced
+    // to 0 for riders at generation to prevent double deduction
+    // alongside this field — see payrollSnapshotService.js.
+
+    riderCashAdvanceDeduction: {
+      type:    Number,
+      default: 0,
+      min:     [0, 'Rider cash advance deduction cannot be negative'],
+    },
+
     // ── Manual Adjustments ────────────────────────────────────
 
     manualBonus: {

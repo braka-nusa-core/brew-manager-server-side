@@ -30,6 +30,7 @@ const { Schema, model } = mongoose
 
 const EMPLOYEE_TYPES = ['barista', 'cashier', 'supervisor', 'rider']
 const KTP_STATUSES    = ['pending', 'received']
+const ALLOWANCE_PAYMENT_PERIODS = ['daily', 'monthly']
 
 const employeeSchema = new Schema(
   {
@@ -179,6 +180,24 @@ const employeeSchema = new Schema(
       min:     [0, 'Daily allowance amount cannot be negative'],
       default: 25000,
     },
+
+    // ── Wallet Allowance Payment Period (Phase 2.5 addition) ───
+    // Governs WHEN a rider's daily allowance (earned via daily_credit,
+    // unchanged by this field) is considered payable/settled — a
+    // purely wallet-side concept, UNRELATED to salaryType below
+    // (['monthly','daily'] — base-salary payment structure for
+    // fixed-payroll-outlet employees). Default 'daily' for backward
+    // compatibility — existing riders already receive daily
+    // settlement behavior and must not silently change after deploy.
+
+    allowancePaymentPeriod: {
+      type:    String,
+      enum:    {
+        values:  ALLOWANCE_PAYMENT_PERIODS,
+        message: `allowancePaymentPeriod must be one of: ${ALLOWANCE_PAYMENT_PERIODS.join(', ')}`,
+      },
+      default: 'daily',
+    },
   },
   {
     timestamps: true,
@@ -197,4 +216,4 @@ const Employee = model('Employee', employeeSchema)
 
 export default Employee
 
-export { EMPLOYEE_TYPES, KTP_STATUSES }
+export { EMPLOYEE_TYPES, KTP_STATUSES, ALLOWANCE_PAYMENT_PERIODS }

@@ -19,6 +19,7 @@ import Attendance from '../../models/Attendance.model.js'
 import Employee   from '../../models/Employee.model.js'
 import { buildPaginationQuery, buildPaginationMeta } from '../../utils/pagination.js'
 import { ROLES } from '../../constants/permissions.js'
+import { createDailyCreditInSession } from '../employeeWallet/employeeWallet.service.js'
 
 // ── Helpers ───────────────────────────────────────────────────
 
@@ -202,7 +203,7 @@ export const ensurePresentAttendance = async (
   const employeeOid = new mongoose.Types.ObjectId(employeeId)
   const normalizedDate = normalizeDate(date)
 
-  await Attendance.findOneAndUpdate(
+  const rawResult = await Attendance.findOneAndUpdate(
     {
       tenantId:   tenantOid,
       employeeId: employeeOid,
@@ -219,8 +220,28 @@ export const ensurePresentAttendance = async (
         recordedBy: new mongoose.Types.ObjectId(recordedBy),
       },
     },
-    { upsert: true, new: true, setDefaultsOnInsert: true, session }
+    {
+      upsert:                true,
+      new:                   true,
+      setDefaultsOnInsert:   true,
+      session,
+      includeResultMetadata: true, // Phase 2.2 — needed to detect actual insert vs matched-existing below
+    }
   )
+
+  // Mongoose 8 / MongoDB driver: with includeResultMetadata, the raw
+  // findAndModify ModifyResult is returned. `lastErrorObject.upserted`
+  // is only set when this call performed an insert.
+  const wasInserted = Boolean(rawResult?.lastErrorObject?.upserted)
+
+  if (wasInserted) {
+    await createDailyCreditInSession(session, {
+      tenantId,
+      employeeId,
+      date:      normalizedDate,
+      createdBy: recordedBy,
+    })
+  }
 }
 
 /**
@@ -462,4 +483,4 @@ export const deleteAttendance = async ({ tenantId, user, attendanceId }) => {
     err.statusCode = 404
     throw err
   }
-} 
+}

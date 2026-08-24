@@ -509,3 +509,141 @@ export const getProductMargins = async (tenantId) => {
     }
   })
 }
+
+// ── getDailyPaymentSummary (Phase 3.3, extended Phase 3.4) ──────
+//
+// Read-only daily closing summary. NOT a "closing" workflow: no
+// status field, no closedAt/closedBy, no locking, no approval. This
+// only aggregates EXISTING data (Sale.totalRevenue/totalCups/
+// paymentMethod, populated since Phase 3.2's CupRecord-finalize
+// integration) — nothing is written, nothing prevents further
+// CupRecord/Sale activity for the summarized outlet/date.
+//
+// Natural unit = outlet + date, matching the grouping already
+// established by cup.service.js#getReconciliation (CupRecord
+// quantities) and this file's own getSummary/getSalesTrend (Sale
+// revenue).
+//
+// Phase 3.4: totalExpense + netRevenue added, reusing the exact
+// Expense-aggregation pattern and match-scope already established in
+// getSummary() above. NOT assumed to be cash-specific — Expense has
+// no paymentMethod field, so totalExpense is only ever subtracted
+// from totalRevenue (mirroring the existing
+// netProfit = totalRevenue - totalExpense precedent), never from
+// cashRevenue specifically. A day with expenses but zero Sale
+// activity still appears (not silently dropped).
+//
+// Reuses buildMatchScope()/applyDateRange() verbatim — same
+// tenant/outlet role-scoping as every other endpoint in this file.
+//
+// @param {Object} params
+// @param {string|null} params.tenantId
+// @param {Object} params.user
+// @param {Object} params.queryParams - { startDate, endDate, outletId }
+// @returns {Promise<Array>} one entry per {outletId, date} in scope
+// (from Sale activity, Expense activity, or both)
+export const getDailyPaymentSummary = async ({ tenantId, user, queryParams }) => {
+  const match = applyDateRange(buildMatchScope(tenantId, user, queryParams), queryParams)
+
+  const [saleResults, expenseResults] = await Promise.all([
+    Sale.aggregate([
+      { $match: match },
+      {
+        $group: {
+          _id: { outletId: '$outletId', date: '$date' },
+          totalRevenue:       { $sum: '$totalRevenue' },
+          totalCups:          { $sum: '$totalCups' },
+          cashRevenue:        { $sum: { $cond: [{ $eq: ['$paymentMethod', 'cash'] },     '$totalRevenue', 0] } },
+          transferRevenue:    { $sum: { $cond: [{ $eq: ['$paymentMethod', 'transfer'] }, '$totalRevenue', 0] } },
+          qrisRevenue:        { $sum: { $cond: [{ $eq: ['$paymentMethod', 'qris'] },     '$totalRevenue', 0] } },
+          // Sales with no paymentMethod set — either predates Phase 3.2's
+          // finalize integration, or finalize was called without one.
+          unspecifiedRevenue: { $sum: { $cond: [{ $eq: ['$paymentMethod', null] },       '$totalRevenue', 0] } },
+          // Proxy for "number of finalized CupRecords" — Sale is
+          // upserted 1:1 with each finalized CupRecord (origin: 'system'),
+          // plus any manually-entered Sales in the same scope.
+          recordCount:        { $sum: 1 },
+          riderIds:           { $addToSet: '$employeeId' },
+        },
+      },
+      { $addFields: { riderCount: { $size: '$riderIds' } } },
+      {
+        $project: {
+          _id: 0,
+          outletId:           '$_id.outletId',
+          date:               '$_id.date',
+          totalRevenue:       1,
+          totalCups:          1,
+          cashRevenue:        1,
+          transferRevenue:    1,
+          qrisRevenue:        1,
+          unspecifiedRevenue: 1,
+          recordCount:        1,
+          riderCount:         1,
+        },
+      },
+    ]),
+
+    // Phase 3.4 — same outlet+date grouping, same match-scope pattern
+    // already established for Expense in getSummary() above.
+    Expense.aggregate([
+      { $match: match },
+      {
+        $group: {
+          _id: { outletId: '$outletId', date: '$date' },
+          totalExpense: { $sum: '$amount' },
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          outletId:     '$_id.outletId',
+          date:         '$_id.date',
+          totalExpense: 1,
+        },
+      },
+    ]),
+  ])
+
+  // Merge Sale-based rows with Expense-based rows by {outletId, date} —
+  // a day with expenses but zero Sale activity must still appear.
+  const byKey = new Map()
+  const keyOf = (outletId, date) => `${outletId}|${new Date(date).toISOString()}`
+
+  for (const row of saleResults) {
+    byKey.set(keyOf(row.outletId, row.date), {
+      ...row,
+      totalExpense: 0,
+      netRevenue:   row.totalRevenue,
+    })
+  }
+
+  for (const row of expenseResults) {
+    const key = keyOf(row.outletId, row.date)
+    const existing = byKey.get(key)
+    if (existing) {
+      existing.totalExpense = row.totalExpense
+      existing.netRevenue   = existing.totalRevenue - row.totalExpense
+    } else {
+      byKey.set(key, {
+        outletId:           row.outletId,
+        date:               row.date,
+        totalRevenue:       0,
+        totalCups:          0,
+        cashRevenue:        0,
+        transferRevenue:    0,
+        qrisRevenue:        0,
+        unspecifiedRevenue: 0,
+        recordCount:        0,
+        riderCount:         0,
+        totalExpense:       row.totalExpense,
+        netRevenue:         -row.totalExpense,
+      })
+    }
+  }
+
+  return [...byKey.values()].sort((a, b) => {
+    const dateDiff = new Date(b.date) - new Date(a.date)
+    return dateDiff !== 0 ? dateDiff : String(a.outletId).localeCompare(String(b.outletId))
+  })
+}
